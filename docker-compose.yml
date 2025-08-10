@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    container_name: cdn_db
+    environment:
+      POSTGRES_DB: onlihub
+      POSTGRES_USER: onlihub
+      POSTGRES_PASSWORD: onlihub
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U onlihub -d onlihub"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  cdn:
+    build: .
+    container_name: cdn_rs
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # настроить при необходимости
+      BIND_ADDR: 0.0.0.0:8080
+      MEDIA_BASE_DIR: /var/www/onlihub/data/www/onlihub-media.com/
+      NO_IMAGE_FILE: no-image-01.jpg
+      MAX_IMAGE_SIDE: 1600
+      DATABASE_URL: postgres://onlihub:onlihub@db:5432/onlihub
+      SWAGGER_ENABLED: "true"
+      SWAGGER_TITLE: "Onlihub Media CDN"
+      SWAGGER_VERSION: "1.0.0"
+      USE_PROXIES: "false"
+      # SENTRY_DSN: ""  # при необходимости
+    volumes:
+      - ./media:/var/www/onlihub/data/www/onlihub-media.com/
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
