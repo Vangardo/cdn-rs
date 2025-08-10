@@ -1,7 +1,8 @@
 use crate::{config::Settings, db::Db, errors::ApiError, proxy, util};
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use image::{imageops::FilterType, DynamicImage, ImageOutputFormat, RgbaImage};
+use base64::Engine;
+use image::codecs::jpeg::JpegEncoder;
+use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, RgbaImage};
 use reqwest::Client;
 use std::{fs, io::Cursor, path::Path};
 use tokio::{fs as tokio_fs, task};
@@ -26,7 +27,11 @@ fn normalize_onlihub_extensions(mut url: String) -> String {
     url
 }
 
-pub async fn save_img_from_url(url: &str, output_path: &str, settings: &Settings) -> Result<(), ApiError> {
+pub async fn save_img_from_url(
+    url: &str,
+    output_path: &str,
+    settings: &Settings,
+) -> Result<(), ApiError> {
     if url.is_empty() {
         return Err(ApiError::BadRequest("empty url".into()));
     }
@@ -37,26 +42,31 @@ pub async fn save_img_from_url(url: &str, output_path: &str, settings: &Settings
 
     let norm_url = normalize_onlihub_extensions(url.to_string());
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(4))
-        .build()
-        .map_err(|e| ApiError::Io(e.to_string()))?;
-
-    let mut req = client.get(&norm_url);
-
-    // В Python прокси выключены; у нас под флагом
+    let mut builder = Client::builder().timeout(std::time::Duration::from_secs(4));
     if settings.use_proxies {
         if let Some(px) = proxy::random_proxy() {
-            req = req.proxy(reqwest::Proxy::http(&px).unwrap())
-                .proxy(reqwest::Proxy::https(&px).unwrap());
+            if let Ok(proxy) = reqwest::Proxy::all(&px) {
+                builder = builder.proxy(proxy);
+            }
         }
     }
+    let client = builder.build().map_err(|e| ApiError::Io(e.to_string()))?;
 
-    let resp = req.send().await.map_err(|e| ApiError::Io(e.to_string()))?;
+    let resp = client
+        .get(&norm_url)
+        .send()
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(ApiError::Io(format!("download failed: HTTP {}", resp.status())));
+        return Err(ApiError::Io(format!(
+            "download failed: HTTP {}",
+            resp.status()
+        )));
     }
-    let bytes = resp.bytes().await.map_err(|e| ApiError::Io(e.to_string()))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
     tokio_fs::write(output_path, &bytes)
         .await
         .map_err(|e| ApiError::Io(e.to_string()))?;
@@ -85,15 +95,17 @@ pub async fn convert_and_save_jpg(
         let img = image::load_from_memory(&decoded).map_err(|e| ApiError::Img(e.to_string()))?;
         let rgb = img.to_rgb8();
         let mut buf = Vec::new();
-        let mut cursor = Cursor::new(&mut buf);
-        rgb.write_to(&mut cursor, ImageOutputFormat::Jpeg(85))
-            .map_err(|e| ApiError::Img(e.to_string()))?;
+        {
+            let mut cursor = Cursor::new(&mut buf);
+            JpegEncoder::new_with_quality(&mut cursor, 85)
+                .encode_image(&rgb)
+                .map_err(|e| ApiError::Img(e.to_string()))?;
+        }
         fs::write(&out_path, &buf).map_err(|e| ApiError::Io(e.to_string()))?;
         Ok(())
     })
-        .await
-        .map_err(|e| ApiError::Internal)?
-        ?;
+    .await
+    .map_err(|_| ApiError::Internal)??;
 
     db.update_image_status(id, 4).await?;
     Ok((id, guid))
@@ -156,7 +168,7 @@ pub async fn get_resize_image_bytes(
         let input_path = input_path.clone();
         move || image::open(&input_path)
     })
-        .await
+    .await
     {
         Ok(Ok(img)) => img,
         _ => {
@@ -169,10 +181,10 @@ pub async fn get_resize_image_bytes(
                         let input_path = input_path.clone();
                         move || image::open(&input_path)
                     })
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or_else(|| image::open(settings.no_image_full_path()).unwrap())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_else(|| image::open(settings.no_image_full_path()).unwrap())
                 } else {
                     image::open(settings.no_image_full_path()).unwrap()
                 }
@@ -183,7 +195,7 @@ pub async fn get_resize_image_bytes(
     };
 
     // Определяем рамку
-    let (mut w, mut h) = img.dimensions();
+    let (w, h) = img.dimensions();
     let (mut target_w, mut target_h) = match (width, height) {
         (Some(w), Some(h)) => (w, h),
         (Some(w), None) => {
@@ -199,8 +211,12 @@ pub async fn get_resize_image_bytes(
 
     // Лимиты (как в Python)
     let max_side = settings.max_image_side;
-    if target_w > max_side { target_w = max_side; }
-    if target_h > max_side { target_h = max_side; }
+    if target_w > max_side {
+        target_w = max_side;
+    }
+    if target_h > max_side {
+        target_h = max_side;
+    }
 
     if width.is_some() || height.is_some() {
         // вписываем внутрь рамки (без выхода за пределы)
@@ -217,19 +233,29 @@ pub async fn get_resize_image_bytes(
 
     // Формат
     let fmt = match format.map(|f| f.to_ascii_uppercase()) {
-        Some(ref s) if s == "PNG" => ImageOutputFormat::Png,
-        Some(ref s) if s == "GIF" => ImageOutputFormat::Gif,
-        Some(ref s) if s == "TIFF" => ImageOutputFormat::Tiff,
-        Some(ref s) if s == "WEBP" => ImageOutputFormat::WebP,
-        _ => ImageOutputFormat::Jpeg(85),
+        Some(ref s) if s == "PNG" => ImageFormat::Png,
+        Some(ref s) if s == "GIF" => ImageFormat::Gif,
+        Some(ref s) if s == "TIFF" => ImageFormat::Tiff,
+        Some(ref s) if s == "WEBP" => ImageFormat::WebP,
+        _ => ImageFormat::Jpeg,
     };
 
-    let mut buf = Vec::new();
-    let mut cur = Cursor::new(&mut buf);
-    task::spawn_blocking(move || composed.write_to(&mut cur, fmt))
-        .await
-        .map_err(|_| ApiError::Internal)?
-        .map_err(|e| ApiError::Img(e.to_string()))?;
+    let buf = task::spawn_blocking(move || -> Result<Vec<u8>, image::ImageError> {
+        let mut buf = Vec::new();
+        {
+            let mut cur = Cursor::new(&mut buf);
+            match fmt {
+                ImageFormat::Jpeg => {
+                    JpegEncoder::new_with_quality(&mut cur, 85).encode_image(&composed)?
+                }
+                other => composed.write_to(&mut cur, other)?,
+            }
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|_| ApiError::Internal)?
+    .map_err(|e| ApiError::Img(e.to_string()))?;
 
     // content-type
     let ct = match format.map(|f| f.to_ascii_lowercase()).as_deref() {
@@ -239,7 +265,7 @@ pub async fn get_resize_image_bytes(
         Some("webp") => "image/webp",
         _ => "image/jpeg",
     }
-        .to_string();
+    .to_string();
 
     Ok((buf, ct))
 }
