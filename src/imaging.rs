@@ -2,7 +2,7 @@ use crate::{config::Settings, db::Db, errors::ApiError, proxy, util};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
-use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, RgbaImage};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
 use reqwest::Client;
 use std::{fs, io::Cursor, path::Path};
 use tokio::{fs as tokio_fs, task};
@@ -172,14 +172,18 @@ pub async fn get_resize_image_bytes(
     {
         Ok(Ok(img)) => img,
         _ => {
-            let open_no_image = || {
-                image::open(settings.no_image_full_path()).map_err(|e| ApiError::Io(e.to_string()))
+            let open_no_image = || -> Result<DynamicImage, ApiError> {
+                match image::open(settings.no_image_full_path()) {
+                    Ok(img) => Ok(img),
+                    Err(_) => {
+                        let img = RgbaImage::from_pixel(1, 1, Rgba([255, 255, 255, 255]));
+                        Ok(DynamicImage::ImageRgba8(img))
+                    }
+                }
             };
             if !guid.is_nil() {
                 if let Some(link) = db.get_original_link_by_guid(guid).await? {
                     let _ = save_img_from_url(&link, &input_path, settings).await;
-                    // маленькая пауза как в Python (sleep 0.5)
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     match task::spawn_blocking({
                         let input_path = input_path.clone();
                         move || image::open(&input_path)
