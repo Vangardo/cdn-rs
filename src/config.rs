@@ -27,7 +27,8 @@ impl Settings {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1600);
 
-        let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let database_url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://user:pass@localhost:5432/onlihub".into());
 
         let sentry_dsn = env::var("SENTRY_DSN").ok().filter(|s| !s.is_empty());
 
