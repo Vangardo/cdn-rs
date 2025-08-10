@@ -172,24 +172,30 @@ pub async fn get_resize_image_bytes(
     {
         Ok(Ok(img)) => img,
         _ => {
+            let open_no_image = || {
+                image::open(settings.no_image_full_path()).map_err(|e| ApiError::Io(e.to_string()))
+            };
             if !guid.is_nil() {
                 if let Some(link) = db.get_original_link_by_guid(guid).await? {
                     let _ = save_img_from_url(&link, &input_path, settings).await;
                     // маленькая пауза как в Python (sleep 0.5)
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    task::spawn_blocking({
+                    match task::spawn_blocking({
                         let input_path = input_path.clone();
                         move || image::open(&input_path)
                     })
                     .await
                     .ok()
                     .and_then(Result::ok)
-                    .unwrap_or_else(|| image::open(settings.no_image_full_path()).unwrap())
+                    {
+                        Some(img) => img,
+                        None => open_no_image()?,
+                    }
                 } else {
-                    image::open(settings.no_image_full_path()).unwrap()
+                    open_no_image()?
                 }
             } else {
-                image::open(settings.no_image_full_path()).unwrap()
+                open_no_image()?
             }
         }
     };
