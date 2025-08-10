@@ -475,6 +475,8 @@ dependencies = [
  "mime",
  "num_cpus",
  "once_cell",
+ "rand 0.8.5",
+ "regex",
  "reqwest",
  "sentry",
  "sentry-tracing 0.32.3",

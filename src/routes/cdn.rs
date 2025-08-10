@@ -1,6 +1,5 @@
 use actix_web::{get, post, web, HttpResponse};
 use serde::Deserialize;
-use utoipa::path;
 
 use crate::{
     config::Settings,
@@ -10,9 +9,9 @@ use crate::{
     models::image::{PushImageWrapper, ResponsePushImage},
 };
 
-#[post("/images/")]
-#[path(
+#[utoipa::path(
     post,
+    path = "/images/",
     tag = "CDN",
     request_body = PushImageWrapper,
     responses(
@@ -20,6 +19,7 @@ use crate::{
         (status = 400, description = "bad request", body = ResponsePushImage)
     )
 )]
+#[post("/images/")]
 pub async fn push_image(
     body: web::Json<PushImageWrapper>,
     db: web::Data<Db>,
@@ -42,18 +42,15 @@ pub async fn push_image(
     }
 }
 
-#[get("/{img_guid}/{parametr_images}")]
-#[path(
+#[utoipa::path(
     get,
+    path = "/{img_guid}/{parametr_images}",
     tag = "CDN",
-    params(
-        ("img_guid" = String, Path, description = "GUID изображения"),
-        ("parametr_images" = String, Path, description = "Формат HxW, как в Python")
-    ),
     responses(
         (status = 200, description = "image", content_type = "image/jpeg")
     )
 )]
+#[get("/{img_guid}/{parametr_images}")]
 pub async fn get_resize_image_root(
     path: web::Path<(String, String)>,
     db: web::Data<Db>,
@@ -67,24 +64,42 @@ pub async fn get_resize_image_root(
     // лимиты 1600 как в Python
     let cap = |v: Option<u32>| v.map(|x| x.min(settings.max_image_side));
 
-    let (bytes, ct) = get_resize_image_bytes(&guid, cap(w), cap(h), Some("JPEG"), Some("ffffff"), &db, &settings).await?;
+    let (bytes, ct) = get_resize_image_bytes(
+        &guid,
+        cap(w),
+        cap(h),
+        Some("JPEG"),
+        Some("ffffff"),
+        &db,
+        &settings,
+    )
+    .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
 }
 
-#[get("/{img_guid}/")]
-#[path(
+#[utoipa::path(
     get,
+    path = "/{img_guid}/",
     tag = "CDN",
-    params(("img_guid" = String, Path, description = "GUID изображения")),
     responses((status = 200, description = "image", content_type = "image/jpeg"))
-)]
+ )]
+#[get("/{img_guid}/")]
 pub async fn get_original_image_root(
     path: web::Path<String>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
 ) -> Result<HttpResponse, ApiError> {
     let guid = path.into_inner();
-    let (bytes, ct) = get_resize_image_bytes(&guid, None, None, Some("JPEG"), Some("ffffff"), &db, &settings).await?;
+    let (bytes, ct) = get_resize_image_bytes(
+        &guid,
+        None,
+        None,
+        Some("JPEG"),
+        Some("ffffff"),
+        &db,
+        &settings,
+    )
+    .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
 }
 
@@ -98,19 +113,13 @@ pub struct FormatQuery {
     pub odn_bg: Option<String>,
 }
 
-#[get("/{img_guid}.{format}")]
-#[path(
+#[utoipa::path(
     get,
+    path = "/{img_guid}.{format}",
     tag = "CDN",
-    params(
-        ("img_guid" = String, Path),
-        ("format" = String, Path, description="JPEG|PNG|GIF|TIFF|WebP (регистр игнорируем)"),
-        ("odnWidth" = Option<u32>, Query),
-        ("odnHeight" = Option<u32>, Query),
-        ("odnBg" = Option<String>, Query)
-    ),
     responses((status=200, description="image", content_type="image/*"))
-)]
+ )]
+#[get("/{img_guid}.{format}")]
 pub async fn get_image_with_format(
     path: web::Path<(String, String)>,
     q: web::Query<FormatQuery>,
@@ -131,20 +140,17 @@ pub async fn get_image_with_format(
         &db,
         &settings,
     )
-        .await?;
+    .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
 }
 
-#[get("/images/{img_guid}/{parametr_images}")]
-#[path(
+#[utoipa::path(
     get,
+    path = "/images/{img_guid}/{parametr_images}",
     tag = "CDN",
-    params(
-        ("img_guid" = String, Path),
-        ("parametr_images" = String, Path, description = "HxW")
-    ),
     responses((status = 200, description="image", content_type="image/jpeg"))
-)]
+ )]
+#[get("/images/{img_guid}/{parametr_images}")]
 pub async fn get_resize_image_prefixed(
     path: web::Path<(String, String)>,
     db: web::Data<Db>,
@@ -156,23 +162,41 @@ pub async fn get_resize_image_prefixed(
     let w = parts.next().and_then(|s| s.parse::<u32>().ok());
     let cap = |v: Option<u32>| v.map(|x| x.min(settings.max_image_side));
 
-    let (bytes, ct) = get_resize_image_bytes(&guid, cap(w), cap(h), Some("JPEG"), Some("ffffff"), &db, &settings).await?;
+    let (bytes, ct) = get_resize_image_bytes(
+        &guid,
+        cap(w),
+        cap(h),
+        Some("JPEG"),
+        Some("ffffff"),
+        &db,
+        &settings,
+    )
+    .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
 }
 
-#[get("/images/{img_guid}/")]
-#[path(
+#[utoipa::path(
     get,
+    path = "/images/{img_guid}/",
     tag = "CDN",
-    params(("img_guid" = String, Path)),
     responses((status = 200, description="image", content_type="image/jpeg"))
-)]
+ )]
+#[get("/images/{img_guid}/")]
 pub async fn get_original_image_prefixed(
     path: web::Path<String>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
 ) -> Result<HttpResponse, ApiError> {
     let guid = path.into_inner();
-    let (bytes, ct) = get_resize_image_bytes(&guid, None, None, Some("JPEG"), Some("ffffff"), &db, &settings).await?;
+    let (bytes, ct) = get_resize_image_bytes(
+        &guid,
+        None,
+        None,
+        Some("JPEG"),
+        Some("ffffff"),
+        &db,
+        &settings,
+    )
+    .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
 }

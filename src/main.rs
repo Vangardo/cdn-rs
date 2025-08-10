@@ -13,6 +13,7 @@ use actix_web::{middleware::Logger, web, App, HttpServer};
 use config::Settings;
 use db::Db;
 use tracing_subscriber::{fmt, EnvFilter};
+use utoipa::OpenApi;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -41,7 +42,10 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         let swagger = if settings.swagger_enabled {
-            Some(utoipa_swagger_ui::SwaggerUi::new("/docs/{_:.*}").url("/api-docs/openapi.json", openapi.clone()))
+            Some(
+                utoipa_swagger_ui::SwaggerUi::new("/docs/{_:.*}")
+                    .url("/api-docs/openapi.json", openapi.clone()),
+            )
         } else {
             None
         };
@@ -59,16 +63,26 @@ async fn main() -> std::io::Result<()> {
             .service(routes::cdn::get_original_image_root);
 
         if let Some(sw) = swagger {
-            app = app.service(sw).route("/api-docs/openapi.json", web::get().to({
-                let json = serde_json::to_string(&openapi).unwrap();
-                move || async move { actix_web::HttpResponse::Ok().content_type("application/json").body(json.clone()) }
-            }));
+            app = app.service(sw).route(
+                "/api-docs/openapi.json",
+                web::get().to({
+                    let json = serde_json::to_string(&openapi).unwrap();
+                    move || {
+                        let json = json.clone();
+                        async move {
+                            actix_web::HttpResponse::Ok()
+                                .content_type("application/json")
+                                .body(json)
+                        }
+                    }
+                }),
+            );
         }
 
         app
     })
-        .workers(num_cpus::get().max(4)) // разумное количество воркеров
-        .bind(bind_addr)?
-        .run()
-        .await
+    .workers(num_cpus::get().max(4)) // разумное количество воркеров
+    .bind(bind_addr)?
+    .run()
+    .await
 }
