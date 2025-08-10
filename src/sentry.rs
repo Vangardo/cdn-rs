@@ -8,7 +8,7 @@ pub fn init_sentry(dsn: Option<String>) -> Option<ClientInitGuard> {
         sentry::ClientOptions {
             release: sentry::release_name!(),
             traces_sample_rate: 0.1,
-            shutdown_timeout: Duration::from_secs(2),
+            shutdown_timeout: Duration::ZERO,
             ..Default::default()
         },
     ));
