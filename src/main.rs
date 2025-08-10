@@ -6,7 +6,6 @@ mod models;
 mod openapi;
 mod proxy;
 mod routes;
-mod sentry;
 mod util;
 
 use actix_web::{middleware::Logger, web, App, HttpServer};
@@ -22,12 +21,6 @@ async fn main() -> std::io::Result<()> {
     fmt().with_env_filter(filter).init();
 
     let settings = Settings::from_env();
-
-    // Sentry
-    let _guard = sentry::init_sentry(settings.sentry_dsn.clone());
-    if settings.sentry_dsn.is_some() {
-        tracing::info!("Sentry enabled");
-    }
 
     // DB pool
     let db = Db::connect(&settings.database_url)
@@ -53,7 +46,7 @@ async fn main() -> std::io::Result<()> {
         let mut app = App::new()
             .app_data(web::Data::new(settings.clone()))
             .app_data(web::Data::new(db.clone()))
-            .wrap(Logger::default())
+            .wrap(Logger::new("%r %s %Dms"))
             // порядок важен, чтобы /images/... не перехватывался общим мэчером
             .service(routes::cdn::push_image)
             .service(routes::cdn::get_resize_image_prefixed)

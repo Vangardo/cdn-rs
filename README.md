@@ -29,7 +29,6 @@ cdn-rs/
    ├─ config.rs
    ├─ errors.rs
    ├─ db.rs
-   ├─ sentry.rs
    ├─ proxy.rs
    ├─ util.rs
    ├─ imaging.rs
@@ -91,7 +90,6 @@ cdn-rs/
 | `NO_IMAGE_FILE` | Имя файла-заглушки внутри `MEDIA_BASE_DIR` | `no-image-01.jpg` |
 | `MAX_IMAGE_SIDE` | Лимит на сторону при ресайзе | `1600` |
 | `DATABASE_URL` | Строка подключения к Postgres | — (обязательна) |
-| `SENTRY_DSN` | Sentry DSN (опционально) | — |
 | `SWAGGER_ENABLED` | Включить Swagger UI (`true`/`false`) | `true` |
 | `SWAGGER_TITLE` | Заголовок для Swagger | `Onlihub Media CDN` |
 | `SWAGGER_VERSION` | Версия API в Swagger | `1.0.0` |

@@ -4,7 +4,7 @@ use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
 use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
 use reqwest::Client;
-use std::{fs, io::Cursor, path::Path};
+use std::{fs, io::Cursor, path::Path, time::Instant};
 use tokio::{fs as tokio_fs, task};
 use uuid::Uuid;
 
@@ -78,6 +78,7 @@ pub async fn convert_and_save_jpg(
     db: &Db,
     settings: &Settings,
 ) -> Result<(i64, Uuid), ApiError> {
+    let started = Instant::now();
     // status: 1 => downloading/creating, 4 => converted
     let guid = Uuid::new_v4();
     let id = db.insert_image_with_status(guid, 1).await?;
@@ -108,6 +109,7 @@ pub async fn convert_and_save_jpg(
     .map_err(|_| ApiError::Internal)??;
 
     db.update_image_status(id, 4).await?;
+    tracing::info!("convert_and_save_jpg took {}ms", started.elapsed().as_millis());
     Ok((id, guid))
 }
 
@@ -148,6 +150,8 @@ pub async fn get_resize_image_bytes(
     db: &Db,
     settings: &Settings,
 ) -> Result<(Vec<u8>, String), ApiError> {
+    let started = Instant::now();
+
     // Разбираем guid
     let guid = if util::is_guid(guid_or_slug) {
         util::parse_guid(guid_or_slug).ok_or(ApiError::BadRequest("invalid guid".into()))?
@@ -277,5 +281,6 @@ pub async fn get_resize_image_bytes(
     }
     .to_string();
 
+    tracing::info!("get_resize_image_bytes took {}ms", started.elapsed().as_millis());
     Ok((buf, ct))
 }

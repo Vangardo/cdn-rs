@@ -39,7 +39,4 @@ utoipa-swagger-ui = { version = "7", features = ["actix-web"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-# Sentry (необязательно, включается через .env)
-sentry = { version = "0.34", default-features = false, features = ["reqwest", "backtrace"] }
-sentry-tracing = "0.32"
 num_cpus = "1.17.0"

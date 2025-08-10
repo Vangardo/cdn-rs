@@ -8,7 +8,6 @@ pub struct Settings {
     pub no_image_file: String,  // relative to media_base_dir, как в Python
     pub max_image_side: u32,
     pub database_url: String,
-    pub sentry_dsn: Option<String>,
     pub swagger_enabled: bool,
     pub swagger_title: String,
     pub swagger_version: String,
@@ -30,8 +29,6 @@ impl Settings {
         let database_url = env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://user:pass@localhost:5432/onlihub".into());
 
-        let sentry_dsn = env::var("SENTRY_DSN").ok().filter(|s| !s.is_empty());
-
         let swagger_enabled = env::var("SWAGGER_ENABLED")
             .map(|s| s == "true" || s == "1")
             .unwrap_or(true);
@@ -49,7 +46,6 @@ impl Settings {
             no_image_file,
             max_image_side,
             database_url,
-            sentry_dsn,
             swagger_enabled,
             swagger_title,
             swagger_version,
