@@ -14,11 +14,38 @@ use uuid::Uuid;
 static BLOCKING_SEM: Lazy<Semaphore> =
     Lazy::new(|| Semaphore::new(num_cpus::get().saturating_sub(1).max(1)));
 
+const JPEG_Q: f32 = 75.0;
+
+trait DecompressExt {
+    fn set_scale(&mut self, num: u32, denom: u32);
+}
+
+impl<R> DecompressExt for Decompress<R> {
+    fn set_scale(&mut self, num: u32, denom: u32) {
+        let denom = denom.max(1);
+        let numer = ((num * 8) / denom).clamp(1, 16) as u8;
+        self.scale(numer);
+    }
+}
+
 fn ensure_dir(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn choose_denom(src_w: u32, src_h: u32, tgt_w: u32, tgt_h: u32) -> u32 {
+    let r = (src_w as f32 / tgt_w.max(1) as f32).max(src_h as f32 / tgt_h.max(1) as f32);
+    if r >= 7.0 {
+        8
+    } else if r >= 3.0 {
+        4
+    } else if r >= 1.5 {
+        2
+    } else {
+        1
+    }
 }
 
 fn normalize_onlihub_extensions(mut url: String) -> String {
@@ -107,7 +134,7 @@ pub async fn convert_and_save_jpg(
         };
         let mut comp = Compress::new(ColorSpace::JCS_RGB);
         comp.set_size(rgb.width() as usize, rgb.height() as usize);
-        comp.set_quality(85.0);
+        comp.set_quality(JPEG_Q);
         comp.set_optimize_scans(false);
         comp.set_optimize_coding(false);
         let mut comp = comp
@@ -257,16 +284,8 @@ pub async fn get_resize_image_bytes(
             let orig_w = dec.width() as u32;
             let orig_h = dec.height() as u32;
             (target_w, target_h) = calc_target(orig_w, orig_h);
-            let mut scale_num = 8u8;
-            for s in [1u8, 2, 4, 8] {
-                if (orig_w as u64 * s as u64 / 8) >= target_w as u64
-                    && (orig_h as u64 * s as u64 / 8) >= target_h as u64
-                {
-                    scale_num = s;
-                    break;
-                }
-            }
-            dec.scale(scale_num);
+            let denom = choose_denom(orig_w, orig_h, target_w, target_h);
+            dec.set_scale(1, denom);
             let mut dec = dec.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
             let src_w = dec.width() as u32;
             let src_h = dec.height() as u32;
@@ -275,7 +294,7 @@ pub async fn get_resize_image_bytes(
                 .map_err(|e| ApiError::Img(e.to_string()))?;
             rgb = RgbImage::from_raw(src_w, src_h, data_buf)
                 .ok_or_else(|| ApiError::Img("decode failed".into()))?;
-            if width.is_some() || height.is_some() {
+            if src_w != target_w || src_h != target_h {
                 let src_image =
                     FirImage::from_vec_u8(src_w, src_h, rgb.into_raw(), fir::PixelType::U8x3)
                         .map_err(|e| ApiError::Img(e.to_string()))?;
@@ -288,9 +307,6 @@ pub async fn get_resize_image_bytes(
                     .map_err(|e| ApiError::Img(e.to_string()))?;
                 rgb = RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
                     .ok_or_else(|| ApiError::Img("resize failed".into()))?;
-            } else {
-                target_w = src_w;
-                target_h = src_h;
             }
         } else {
             let img = if data.is_empty() {
@@ -348,7 +364,7 @@ pub async fn get_resize_image_bytes(
             ImageFormat::Jpeg => {
                 let mut comp = Compress::new(ColorSpace::JCS_RGB);
                 comp.set_size(target_w as usize, target_h as usize);
-                comp.set_quality(85.0);
+                comp.set_quality(JPEG_Q);
                 comp.set_optimize_scans(false);
                 comp.set_optimize_coding(false);
                 let mut comp = comp
