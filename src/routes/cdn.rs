@@ -67,7 +67,7 @@ async fn stream_original(
         }
     };
     let path = format!("{}{}.jpg", settings.media_base_dir, uuid);
-    if Path::new(&path).exists() {
+    if tokio_fs::try_exists(&path).await.unwrap_or(false) {
         let file = NamedFile::open_async(path)
             .await
             .map_err(|e| ApiError::Io(e.to_string()))?;
@@ -156,7 +156,7 @@ pub async fn get_resize_image_root(
     if let Some(uuid) = util::parse_guid(&guid) {
         let (disk_path, _) =
             variant_disk_path(&settings, uuid, w_cap, h_cap, Some("JPEG"), Some("ffffff"));
-        if Path::new(&disk_path).exists() {
+        if tokio_fs::try_exists(&disk_path).await.unwrap_or(false) {
             let file = NamedFile::open_async(disk_path)
                 .await
                 .map_err(|e| ApiError::Io(e.to_string()))?;

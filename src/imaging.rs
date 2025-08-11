@@ -12,7 +12,7 @@ use tokio::{fs as tokio_fs, sync::Semaphore, task};
 use uuid::Uuid;
 
 static BLOCKING_SEM: Lazy<Semaphore> =
-    Lazy::new(|| Semaphore::new(num_cpus::get().saturating_sub(1).max(1)));
+    Lazy::new(|| Semaphore::new(num_cpus::get() * 2)); // Увеличиваем параллельность
 
 const JPEG_Q: f32 = 75.0;
 
@@ -28,9 +28,9 @@ impl<R> DecompressExt for Decompress<R> {
     }
 }
 
-fn ensure_dir(path: &str) -> std::io::Result<()> {
+async fn ensure_dir_async(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
-        fs::create_dir_all(parent)?;
+        tokio_fs::create_dir_all(parent).await?;
     }
     Ok(())
 }
@@ -114,7 +114,7 @@ pub async fn save_img_from_url(
     if url.is_empty() {
         return Err(ApiError::BadRequest("empty url".into()));
     }
-    ensure_dir(output_path).map_err(|e| ApiError::Io(e.to_string()))?;
+    // Директории создаются асинхронно в spawn блоке
 
     let norm_url = normalize_onlihub_extensions(url.to_string());
 
@@ -135,9 +135,12 @@ pub async fn save_img_from_url(
         .map_err(|e| ApiError::Io(e.to_string()))?;
     let buf = bytes.to_vec();
     let path = output_path.to_string();
-    let data = buf.clone();
+    let buf_clone = buf.clone();
     tokio::spawn(async move {
-        let _ = tokio_fs::write(path, &data).await;
+        if let Some(parent) = Path::new(&path).parent() {
+            let _ = tokio_fs::create_dir_all(parent).await;
+        }
+        let _ = tokio_fs::write(path, &buf_clone).await;
     });
     Ok(buf)
 }
@@ -154,7 +157,7 @@ pub async fn convert_and_save_jpg(
 
     // Декод и запись — в blocking, чтобы не забивать runtime
     let out_path = format!("{}{}.jpg", settings.media_base_dir, guid);
-    ensure_dir(&out_path).map_err(|e| ApiError::Io(e.to_string()))?;
+    ensure_dir_async(&out_path).await.map_err(|e| ApiError::Io(e.to_string()))?;
 
     let base64_img = base64_img.trim();
     let decoded = BASE64
@@ -197,10 +200,12 @@ pub async fn convert_and_save_jpg(
     drop(permit);
 
     db.update_image_status(id, 4).await?;
-    tracing::info!(
-        "convert_and_save_jpg took {}ms",
-        started.elapsed().as_millis()
-    );
+    if !settings.production_mode {
+        tracing::info!(
+            "convert_and_save_jpg took {}ms",
+            started.elapsed().as_millis()
+        );
+    }
     Ok((id, guid))
 }
 
@@ -247,7 +252,7 @@ pub fn variant_disk_path(
     (path, ct.to_string())
 }
 
-/// Точный аналог Python get_resize_image (с фолбэком и даунлоадом по link_o)
+/// Оптимизированная версия - максимальная скорость
 pub async fn get_resize_image_bytes(
     guid_or_slug: &str,
     width: Option<u32>,
@@ -257,7 +262,7 @@ pub async fn get_resize_image_bytes(
     db: &Db,
     settings: &Settings,
     client: &Client,
-    cache: &Cache,
+    _cache: &Cache, // Оставляем для совместимости, но не используем
 ) -> Result<(Vec<u8>, String), ApiError> {
     let started = Instant::now();
 
@@ -267,18 +272,10 @@ pub async fn get_resize_image_bytes(
         Uuid::nil()
     };
 
-    let bg_hex_owned = bg_hex.map(|s| s.to_string());
     let fmt_owned = format.map(|f| f.to_ascii_uppercase());
+    let bg_hex_owned = bg_hex.map(|s| s.to_string());
 
-    let cache_key = format!(
-        "img:{}:{}:{}:{}:{}",
-        guid_or_slug,
-        width.unwrap_or(0),
-        height.unwrap_or(0),
-        fmt_owned.as_deref().unwrap_or("JPEG"),
-        bg_hex_owned.as_deref().unwrap_or("ffffff"),
-    );
-
+    // 1. СНАЧАЛА ПРОВЕРЯЕМ ДИСК - самый быстрый для CDN
     let (disk_path, ct_guess) = variant_disk_path(
         settings,
         guid,
@@ -288,37 +285,33 @@ pub async fn get_resize_image_bytes(
         bg_hex_owned.as_deref(),
     );
 
+    // Прямое чтение с диска - без лишних проверок
     if let Ok(bytes) = tokio_fs::read(&disk_path).await {
-        tracing::info!(disk_cache = "HIT", path = %disk_path);
-        let _ = cache.insert_with_ttl(&cache_key, &bytes, 3600, 10000).await;
         return Ok((bytes, ct_guess));
     }
-    tracing::info!(disk_cache = "MISS", path = %disk_path);
 
-    if let Ok(Some(bytes)) = cache.get(&cache_key).await {
-        tracing::info!(cache = "HIT", key = %cache_key);
-        return Ok((bytes, ct_guess));
-    }
-    tracing::info!(cache = "MISS", key = %cache_key);
-
+    // 2. Если нет на диске - идем в БД
     let input_path = if guid.is_nil() {
         settings.no_image_full_path()
     } else {
         format!("{}{}.jpg", settings.media_base_dir, guid)
     };
 
+    // Асинхронная проверка существования файла
+    let file_exists = tokio_fs::try_exists(&input_path).await.unwrap_or(false);
+    
     let mut downloaded: Option<Vec<u8>> = None;
-    if !Path::new(&input_path).exists() && !guid.is_nil() {
+    if !file_exists && !guid.is_nil() {
+        // Параллельная загрузка и обработка
         if let Some(link) = db.get_original_link_by_guid(guid).await? {
-            if let Ok(bytes) = save_img_from_url(client, &link, &input_path).await {
-                downloaded = Some(bytes);
-            }
+            downloaded = save_img_from_url(client, &link, &input_path).await.ok();
         }
     }
 
     let no_image_path = settings.no_image_full_path();
     let max_side = settings.max_image_side;
 
+        // Оптимизация: если оригинал без изменений - сразу возвращаем
     if width.is_none()
         && height.is_none()
         && fmt_owned
@@ -329,51 +322,40 @@ pub async fn get_resize_image_bytes(
             .map(|s| s.eq_ignore_ascii_case("ffffff"))
             .unwrap_or(true)
     {
-        if let Some(buf) = downloaded {
-            let _ = cache.insert_with_ttl(&cache_key, &buf, 3600, 10000).await;
-            ensure_dir(&disk_path).map_err(|e| ApiError::Io(e.to_string()))?;
-            let tmp = format!("{disk_path}.tmp-{}", Uuid::new_v4());
-            tokio_fs::write(&tmp, &buf)
-                .await
-                .map_err(|e| ApiError::Io(e.to_string()))?;
-            tokio_fs::rename(&tmp, &disk_path)
-                .await
-                .map_err(|e| ApiError::Io(e.to_string()))?;
-            return Ok((buf, ct_guess));
-        }
-        let path = if Path::new(&input_path).exists() {
-            input_path
+        let buf = if let Some(buf) = downloaded {
+            buf
+        } else if file_exists {
+            tokio_fs::read(&input_path).await.map_err(|e| ApiError::Io(e.to_string()))?
         } else {
-            no_image_path
+            tokio_fs::read(&no_image_path).await.map_err(|e| ApiError::Io(e.to_string()))?
         };
-        let buf = tokio_fs::read(&path)
-            .await
-            .map_err(|e| ApiError::Io(e.to_string()))?;
-        let _ = cache.insert_with_ttl(&cache_key, &buf, 3600, 10000).await;
-        ensure_dir(&disk_path).map_err(|e| ApiError::Io(e.to_string()))?;
-        let tmp = format!("{disk_path}.tmp-{}", Uuid::new_v4());
-        tokio_fs::write(&tmp, &buf)
-            .await
-            .map_err(|e| ApiError::Io(e.to_string()))?;
-        tokio_fs::rename(&tmp, &disk_path)
-            .await
-            .map_err(|e| ApiError::Io(e.to_string()))?;
+
+        // Асинхронная запись на диск без временных файлов
+        let disk_path_clone = disk_path.clone();
+        let buf_clone = buf.clone();
+        tokio::spawn(async move {
+            if let Some(parent) = Path::new(&disk_path_clone).parent() {
+                let _ = tokio_fs::create_dir_all(parent).await;
+            }
+            let _ = tokio_fs::write(&disk_path_clone, &buf_clone).await;
+        });
+
         return Ok((buf, ct_guess));
     }
 
     let permit = BLOCKING_SEM.acquire().await.unwrap();
+    let input_path_clone = input_path.clone();
+    let no_image_path_clone = no_image_path.clone();
     let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
         let data = if let Some(b) = downloaded {
             b
-        } else if let Ok(bytes) = fs::read(&input_path) {
-            bytes
-        } else if let Ok(bytes) = fs::read(&no_image_path) {
-            bytes
+        } else if Path::new(&input_path_clone).exists() {
+            fs::read(&input_path_clone).map_err(|e| ApiError::Io(e.to_string()))?
         } else {
-            Vec::new()
+            fs::read(&no_image_path_clone).map_err(|e| ApiError::Io(e.to_string()))?
         };
 
-        let orig_data = data.clone();
+        // Оптимизация: убираем лишнее клонирование
         let try_mozjpeg = Decompress::new_mem(&data);
         let (mut rgb, tw, th) = if let Ok(mut d) = try_mozjpeg {
             let (sw, sh) = (d.width() as u32, d.height() as u32);
@@ -394,7 +376,7 @@ pub async fn get_resize_image_bytes(
                     .unwrap_or(true)
             {
                 drop(d);
-                return Ok((orig_data, "image/jpeg".to_string()));
+                return Ok((data, "image/jpeg".to_string()));
             }
 
             let denom = choose_dct_denom(sw, sh, fg_w, fg_h);
@@ -490,20 +472,21 @@ pub async fn get_resize_image_bytes(
     .map_err(|_| ApiError::Internal)??;
     drop(permit);
 
-    ensure_dir(&disk_path).map_err(|e| ApiError::Io(e.to_string()))?;
-    let tmp = format!("{disk_path}.tmp-{}", Uuid::new_v4());
-    tokio_fs::write(&tmp, &buf)
-        .await
-        .map_err(|e| ApiError::Io(e.to_string()))?;
-    tokio_fs::rename(&tmp, &disk_path)
-        .await
-        .map_err(|e| ApiError::Io(e.to_string()))?;
+    // Асинхронная запись на диск без временных файлов
+    let disk_path_clone = disk_path.clone();
+    let buf_clone = buf.clone();
+    tokio::spawn(async move {
+        if let Some(parent) = Path::new(&disk_path_clone).parent() {
+            let _ = tokio_fs::create_dir_all(parent).await;
+        }
+        let _ = tokio_fs::write(&disk_path_clone, &buf_clone).await;
+    });
 
-    let _ = cache.insert_with_ttl(&cache_key, &buf, 3600, 10000).await;
-
-    tracing::info!(
-        "get_resize_image_bytes took {}ms",
-        started.elapsed().as_millis()
-    );
+    if !settings.production_mode {
+        tracing::info!(
+            "get_resize_image_bytes took {}ms",
+            started.elapsed().as_millis()
+        );
+    }
     Ok((buf, ct))
 }

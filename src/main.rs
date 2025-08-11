@@ -100,7 +100,7 @@ async fn main() -> std::io::Result<()> {
 
         app
     })
-    .workers(num_cpus::get().max(4)) // разумное количество воркеров
+    .workers(num_cpus::get()) // максимальное количество воркеров для производительности
     .bind(bind_addr)?
     .run()
     .await

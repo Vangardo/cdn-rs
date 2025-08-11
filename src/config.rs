@@ -17,6 +17,7 @@ pub struct Settings {
     pub swagger_title: String,
     pub swagger_version: String,
     pub use_proxies: bool,
+    pub production_mode: bool,
 }
 
 impl Settings {
@@ -61,6 +62,10 @@ impl Settings {
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false);
 
+        let production_mode = env::var("PRODUCTION_MODE")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false);
+
         Self {
             bind_addr,
             media_base_dir,
@@ -76,6 +81,7 @@ impl Settings {
             swagger_title,
             swagger_version,
             use_proxies,
+            production_mode,
         }
     }
 
