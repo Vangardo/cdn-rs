@@ -9,6 +9,7 @@ use crate::{
     errors::ApiError,
     imaging::{convert_and_save_jpg, get_resize_image_bytes},
     models::image::{PushImageWrapper, ResponsePushImage},
+    cache::Cache,
     util,
 };
 use bytes::Bytes;
@@ -56,7 +57,15 @@ async fn stream_original(
     settings: web::Data<Settings>,
     client: web::Data<Client>,
 ) -> Result<HttpResponse, ApiError> {
-    let uuid = util::parse_guid(&guid).ok_or(ApiError::BadRequest("invalid guid".into()))?;
+    let uuid = match util::parse_guid(&guid) {
+        Some(u) => u,
+        None => {
+            let file = NamedFile::open_async(settings.no_image_full_path())
+                .await
+                .map_err(|e| ApiError::Io(e.to_string()))?;
+            return Ok(file.into_response(&req));
+        }
+    };
     let path = format!("{}{}.jpg", settings.media_base_dir, uuid);
     if Path::new(&path).exists() {
         let file = NamedFile::open_async(path)
@@ -65,21 +74,24 @@ async fn stream_original(
         return Ok(file.into_response(&req));
     }
 
-    let link = db
-        .get_original_link_by_guid(uuid)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let resp = client
-        .get(&link)
-        .send()
-        .await
-        .map_err(|e| ApiError::Io(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(ApiError::Io(format!(
-            "download failed: HTTP {}",
-            resp.status()
-        )));
-    }
+    let link = match db.get_original_link_by_guid(uuid).await? {
+        Some(l) => l,
+        None => {
+            let file = NamedFile::open_async(settings.no_image_full_path())
+                .await
+                .map_err(|e| ApiError::Io(e.to_string()))?;
+            return Ok(file.into_response(&req));
+        }
+    };
+    let resp = match client.get(&link).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            let file = NamedFile::open_async(settings.no_image_full_path())
+                .await
+                .map_err(|e| ApiError::Io(e.to_string()))?;
+            return Ok(file.into_response(&req));
+        }
+    };
     if let Some(parent) = Path::new(&path).parent() {
         tokio_fs::create_dir_all(parent)
             .await
@@ -129,6 +141,7 @@ pub async fn get_resize_image_root(
     db: web::Data<Db>,
     settings: web::Data<Settings>,
     client: web::Data<Client>,
+    cache: web::Data<Cache>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, param) = path.into_inner();
     let mut parts = param.split('x');
@@ -147,6 +160,7 @@ pub async fn get_resize_image_root(
         &db,
         &settings,
         &client,
+        &cache,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
@@ -192,6 +206,7 @@ pub async fn get_image_with_format(
     db: web::Data<Db>,
     settings: web::Data<Settings>,
     client: web::Data<Client>,
+    cache: web::Data<Cache>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, mut format) = path.into_inner();
     let valid = ["JPEG", "PNG", "GIF", "TIFF", "WebP"];
@@ -207,6 +222,7 @@ pub async fn get_image_with_format(
         &db,
         &settings,
         &client,
+        &cache,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
@@ -224,6 +240,7 @@ pub async fn get_resize_image_prefixed(
     db: web::Data<Db>,
     settings: web::Data<Settings>,
     client: web::Data<Client>,
+    cache: web::Data<Cache>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, param) = path.into_inner();
     let mut parts = param.split('x');
@@ -240,6 +257,7 @@ pub async fn get_resize_image_prefixed(
         &db,
         &settings,
         &client,
+        &cache,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
