@@ -30,6 +30,8 @@ reqwest = { version = "0.12", features = ["rustls-tls", "gzip", "brotli", "defla
 
 # Работа с изображениями
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "tiff", "webp"] }
+fast_image_resize = { version = "5", default-features = false, features = ["image"] }
+mozjpeg = { version = "0.10", default-features = false, features = ["with_simd"] }
 
 # OpenAPI/Swagger
 utoipa = { version = "4", features = ["chrono", "uuid"] }
