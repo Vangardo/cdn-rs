@@ -27,10 +27,10 @@ services:
     environment:
       # настроить при необходимости
       BIND_ADDR: 0.0.0.0:8080
-      MEDIA_BASE_DIR: /var/www/onlihub/data/www/onlihub-media.com/
+      MEDIA_BASE_DIR: /images/
       NO_IMAGE_FILE: no-image-01.jpg
       MAX_IMAGE_SIDE: 1600
-      DATABASE_URL: postgres://onlihub:onlihub@db:5432/onlihub
+      DATABASE_URL: postgres://postgres:0X90uyyz8QKMmV7jlJiQ@65.21.189.170:5432/tradeshow
       SWAGGER_ENABLED: "true"
       SWAGGER_TITLE: "Onlihub Media CDN"
       SWAGGER_VERSION: "1.0.0"

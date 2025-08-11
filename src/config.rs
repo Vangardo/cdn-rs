@@ -24,7 +24,7 @@ impl Settings {
         dotenv().ok();
         let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
         let media_base_dir = env::var("MEDIA_BASE_DIR")
-            .unwrap_or_else(|_| "/var/www/onlihub/data/www/onlihub-media.com/".into());
+            .unwrap_or_else(|_| "/images/".into());
         let no_image_file = env::var("NO_IMAGE_FILE").unwrap_or_else(|_| "no-image-01.jpg".into());
         let max_image_side = env::var("MAX_IMAGE_SIDE")
             .ok()
@@ -32,13 +32,13 @@ impl Settings {
             .unwrap_or(1600);
 
         let database_url = env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://user:pass@localhost:5432/onlihub".into());
+            .unwrap_or_else(|_| "postgres://postgres:0X90uyyz8QKMmV7jlJiQ@65.21.189.170:5432/tradeshow".into());
 
         let use_cache = env::var("USE_CACHE")
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false);
 
-        let redis_host = env::var("REDIS_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let redis_host = env::var("REDIS_HOST").unwrap_or_else(|_| "172.26.0.6".into());
         let redis_port = env::var("REDIS_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -46,7 +46,7 @@ impl Settings {
         let redis_db = env::var("REDIS_DB")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or(8);
         let redis_password = env::var("REDIS_PASSWORD").unwrap_or_default();
 
         let swagger_enabled = env::var("SWAGGER_ENABLED")
