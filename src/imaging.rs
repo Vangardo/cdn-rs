@@ -1,9 +1,9 @@
-use crate::{config::Settings, db::Db, errors::ApiError, proxy, util};
+use crate::{config::Settings, db::Db, errors::ApiError, util};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use fast_image_resize::{self as fir, images::Image as FirImage};
-use image::{self, DynamicImage, GenericImageView, ImageFormat, RgbImage};
 use image::imageops;
+use image::{self, DynamicImage, GenericImageView, ImageFormat, RgbImage};
 use mozjpeg::{ColorSpace, Compress};
 use reqwest::Client;
 use std::{fs, io::Cursor, path::Path, time::Instant};
@@ -30,29 +30,16 @@ fn normalize_onlihub_extensions(mut url: String) -> String {
 }
 
 pub async fn save_img_from_url(
+    client: &Client,
     url: &str,
     output_path: &str,
-    settings: &Settings,
-) -> Result<(), ApiError> {
+) -> Result<Vec<u8>, ApiError> {
     if url.is_empty() {
         return Err(ApiError::BadRequest("empty url".into()));
-    }
-    if Path::new(output_path).exists() {
-        return Ok(());
     }
     ensure_dir(output_path).map_err(|e| ApiError::Io(e.to_string()))?;
 
     let norm_url = normalize_onlihub_extensions(url.to_string());
-
-    let mut builder = Client::builder().timeout(std::time::Duration::from_secs(4));
-    if settings.use_proxies {
-        if let Some(px) = proxy::random_proxy() {
-            if let Ok(proxy) = reqwest::Proxy::all(&px) {
-                builder = builder.proxy(proxy);
-            }
-        }
-    }
-    let client = builder.build().map_err(|e| ApiError::Io(e.to_string()))?;
 
     let resp = client
         .get(&norm_url)
@@ -69,10 +56,13 @@ pub async fn save_img_from_url(
         .bytes()
         .await
         .map_err(|e| ApiError::Io(e.to_string()))?;
-    tokio_fs::write(output_path, &bytes)
-        .await
-        .map_err(|e| ApiError::Io(e.to_string()))?;
-    Ok(())
+    let buf = bytes.to_vec();
+    let path = output_path.to_string();
+    let data = buf.clone();
+    tokio::spawn(async move {
+        let _ = tokio_fs::write(path, &data).await;
+    });
+    Ok(buf)
 }
 
 pub async fn convert_and_save_jpg(
@@ -103,8 +93,7 @@ pub async fn convert_and_save_jpg(
         let mut comp = comp
             .start_compress(Vec::new())
             .map_err(|e| ApiError::Img(e.to_string()))?;
-        comp
-            .write_scanlines(&rgb)
+        comp.write_scanlines(&rgb)
             .map_err(|e| ApiError::Img(e.to_string()))?;
         let buf = comp.finish().map_err(|e| ApiError::Img(e.to_string()))?;
         fs::write(&out_path, &buf).map_err(|e| ApiError::Io(e.to_string()))?;
@@ -114,7 +103,10 @@ pub async fn convert_and_save_jpg(
     .map_err(|_| ApiError::Internal)??;
 
     db.update_image_status(id, 4).await?;
-    tracing::info!("convert_and_save_jpg took {}ms", started.elapsed().as_millis());
+    tracing::info!(
+        "convert_and_save_jpg took {}ms",
+        started.elapsed().as_millis()
+    );
     Ok((id, guid))
 }
 
@@ -145,6 +137,7 @@ pub async fn get_resize_image_bytes(
     bg_hex: Option<&str>,
     db: &Db,
     settings: &Settings,
+    client: &Client,
 ) -> Result<(Vec<u8>, String), ApiError> {
     let started = Instant::now();
 
@@ -163,9 +156,12 @@ pub async fn get_resize_image_bytes(
         format!("{}{}.jpg", settings.media_base_dir, guid)
     };
 
+    let mut downloaded: Option<Vec<u8>> = None;
     if !Path::new(&input_path).exists() && !guid.is_nil() {
         if let Some(link) = db.get_original_link_by_guid(guid).await? {
-            let _ = save_img_from_url(&link, &input_path, settings).await;
+            if let Ok(bytes) = save_img_from_url(client, &link, &input_path).await {
+                downloaded = Some(bytes);
+            }
         }
     }
 
@@ -174,13 +170,41 @@ pub async fn get_resize_image_bytes(
     let bg_hex_owned = bg_hex.map(|s| s.to_string());
     let fmt_owned = format.map(|f| f.to_ascii_uppercase());
 
+    if width.is_none()
+        && height.is_none()
+        && fmt_owned
+            .as_deref()
+            .map_or(true, |f| f.eq_ignore_ascii_case("JPEG"))
+        && bg_hex_owned
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("ffffff"))
+            .unwrap_or(true)
+    {
+        if let Some(buf) = downloaded {
+            return Ok((buf, "image/jpeg".to_string()));
+        }
+        let path = if Path::new(&input_path).exists() {
+            input_path
+        } else {
+            no_image_path
+        };
+        let buf = tokio_fs::read(&path)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+        return Ok((buf, "image/jpeg".to_string()));
+    }
+
     let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
-        let img = image::open(&input_path)
-            .or_else(|_| image::open(&no_image_path))
-            .unwrap_or_else(|_| {
-                let img = RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255]));
-                DynamicImage::ImageRgb8(img)
-            });
+        let img = if let Some(b) = downloaded {
+            image::load_from_memory(&b).map_err(|e| ApiError::Img(e.to_string()))?
+        } else {
+            image::open(&input_path)
+                .or_else(|_| image::open(&no_image_path))
+                .unwrap_or_else(|_| {
+                    let img = RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255]));
+                    DynamicImage::ImageRgb8(img)
+                })
+        };
 
         let (orig_w, orig_h) = img.dimensions();
         let (mut target_w, mut target_h) = match (width, height) {
@@ -205,8 +229,9 @@ pub async fn get_resize_image_bytes(
 
         let mut rgb = img.to_rgb8();
         if width.is_some() || height.is_some() {
-            let src_image = FirImage::from_vec_u8(orig_w, orig_h, rgb.into_raw(), fir::PixelType::U8x3)
-                .map_err(|e| ApiError::Img(e.to_string()))?;
+            let src_image =
+                FirImage::from_vec_u8(orig_w, orig_h, rgb.into_raw(), fir::PixelType::U8x3)
+                    .map_err(|e| ApiError::Img(e.to_string()))?;
             let mut dst_image = FirImage::new(target_w, target_h, fir::PixelType::U8x3);
             let mut resizer = fir::Resizer::new();
             let options = fir::ResizeOptions::new()
@@ -250,8 +275,7 @@ pub async fn get_resize_image_bytes(
                 let mut comp = comp
                     .start_compress(Vec::new())
                     .map_err(|e| ApiError::Img(e.to_string()))?;
-                comp
-                    .write_scanlines(&rgb)
+                comp.write_scanlines(&rgb)
                     .map_err(|e| ApiError::Img(e.to_string()))?;
                 buf = comp.finish().map_err(|e| ApiError::Img(e.to_string()))?;
             }
@@ -277,6 +301,9 @@ pub async fn get_resize_image_bytes(
     .await
     .map_err(|_| ApiError::Internal)??;
 
-    tracing::info!("get_resize_image_bytes took {}ms", started.elapsed().as_millis());
+    tracing::info!(
+        "get_resize_image_bytes took {}ms",
+        started.elapsed().as_millis()
+    );
     Ok((buf, ct))
 }

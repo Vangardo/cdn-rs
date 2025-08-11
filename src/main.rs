@@ -11,6 +11,7 @@ mod util;
 use actix_web::{middleware::Logger, web, App, HttpServer};
 use config::Settings;
 use db::Db;
+use reqwest::Client;
 use tracing_subscriber::{fmt, EnvFilter};
 use utoipa::OpenApi;
 
@@ -26,6 +27,16 @@ async fn main() -> std::io::Result<()> {
     let db = Db::connect(&settings.database_url)
         .await
         .expect("db connect failed");
+
+    let mut client_builder = Client::builder().timeout(std::time::Duration::from_secs(4));
+    if settings.use_proxies {
+        if let Some(px) = proxy::random_proxy() {
+            if let Ok(proxy) = reqwest::Proxy::all(&px) {
+                client_builder = client_builder.proxy(proxy);
+            }
+        }
+    }
+    let client = client_builder.build().expect("reqwest client build failed");
 
     // OpenAPI
     let openapi = openapi::ApiDoc::openapi();
@@ -46,6 +57,7 @@ async fn main() -> std::io::Result<()> {
         let mut app = App::new()
             .app_data(web::Data::new(settings.clone()))
             .app_data(web::Data::new(db.clone()))
+            .app_data(web::Data::new(client.clone()))
             .wrap(Logger::new("%r %s %Dms"))
             // порядок важен, чтобы /images/... не перехватывался общим мэчером
             .service(routes::cdn::push_image)
