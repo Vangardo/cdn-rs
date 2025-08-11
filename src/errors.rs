@@ -3,6 +3,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[allow(dead_code)]
     #[error("not found")]
     NotFound,
     #[error("bad request: {0}")]

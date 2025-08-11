@@ -9,6 +9,7 @@ pub struct Db {
 }
 
 #[derive(sqlx::FromRow, Debug, Clone)]
+#[allow(dead_code)]
 pub struct ImageRow {
     pub id: i64,
     pub guid: Uuid,
@@ -31,11 +32,11 @@ impl Db {
         let rec: (i64,) = sqlx::query_as(
             "insert into images (guid, status, status_date) values ($1, $2, now()) returning id",
         )
-            .bind(guid)
-            .bind(status)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| ApiError::Db(e.to_string()))?;
+        .bind(guid)
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ApiError::Db(e.to_string()))?;
         Ok(rec.0)
     }
 
@@ -49,14 +50,15 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn get_image_by_guid(&self, guid: Uuid) -> Result<Option<ImageRow>, ApiError> {
         let rec = sqlx::query_as::<_, ImageRow>(
             "select id, guid, link_o, status, status_date from images where guid = $1",
         )
-            .bind(guid)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| ApiError::Db(e.to_string()))?;
+        .bind(guid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ApiError::Db(e.to_string()))?;
         Ok(rec)
     }
 
@@ -71,6 +73,7 @@ impl Db {
     }
 
     /// get or create by link_o; returns (id, guid)
+    #[allow(dead_code)]
     pub async fn get_or_create_by_link(&self, link: &str) -> Result<(i64, Uuid), ApiError> {
         if let Some((id, guid)) =
             sqlx::query_as::<_, (i64, Uuid)>("select id, guid from images where link_o = $1")
