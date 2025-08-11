@@ -1,4 +1,6 @@
-use actix_web::{get, post, web, HttpResponse};
+use actix_files::NamedFile;
+use actix_web::{get, post, web, HttpRequest, HttpResponse};
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::{
@@ -7,8 +9,12 @@ use crate::{
     errors::ApiError,
     imaging::{convert_and_save_jpg, get_resize_image_bytes},
     models::image::{PushImageWrapper, ResponsePushImage},
+    util,
 };
+use bytes::Bytes;
 use reqwest::Client;
+use std::path::Path;
+use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::mpsc};
 
 #[utoipa::path(
     post,
@@ -41,6 +47,72 @@ pub async fn push_image(
             Err(ApiError::BadRequest(e.to_string()))
         }
     }
+}
+
+async fn stream_original(
+    req: HttpRequest,
+    guid: String,
+    db: web::Data<Db>,
+    settings: web::Data<Settings>,
+    client: web::Data<Client>,
+) -> Result<HttpResponse, ApiError> {
+    let uuid = util::parse_guid(&guid).ok_or(ApiError::BadRequest("invalid guid".into()))?;
+    let path = format!("{}{}.jpg", settings.media_base_dir, uuid);
+    if Path::new(&path).exists() {
+        let file = NamedFile::open_async(path)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+        return Ok(file.into_response(&req));
+    }
+
+    let link = db
+        .get_original_link_by_guid(uuid)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let resp = client
+        .get(&link)
+        .send()
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(ApiError::Io(format!(
+            "download failed: HTTP {}",
+            resp.status()
+        )));
+    }
+    if let Some(parent) = Path::new(&path).parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+    }
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .to_string();
+    let (tx, mut rx) = mpsc::channel::<Bytes>(16);
+    let mut file = tokio_fs::File::create(path)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+    tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            let _ = file.write_all(&chunk).await;
+        }
+    });
+    let stream = resp.bytes_stream().then(move |item| {
+        let tx = tx.clone();
+        async move {
+            match item {
+                Ok(chunk) => {
+                    let _ = tx.send(chunk.clone()).await;
+                    Ok::<Bytes, actix_web::Error>(chunk)
+                }
+                Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+            }
+        }
+    });
+    Ok(HttpResponse::Ok().content_type(ct).streaming(stream))
 }
 
 #[utoipa::path(
@@ -88,24 +160,13 @@ pub async fn get_resize_image_root(
  )]
 #[get("/{img_guid}/")]
 pub async fn get_original_image_root(
+    req: HttpRequest,
     path: web::Path<String>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
     client: web::Data<Client>,
 ) -> Result<HttpResponse, ApiError> {
-    let guid = path.into_inner();
-    let (bytes, ct) = get_resize_image_bytes(
-        &guid,
-        None,
-        None,
-        Some("JPEG"),
-        Some("ffffff"),
-        &db,
-        &settings,
-        &client,
-    )
-    .await?;
-    Ok(HttpResponse::Ok().content_type(ct).body(bytes))
+    stream_original(req, path.into_inner(), db, settings, client).await
 }
 
 #[derive(Deserialize)]
@@ -192,22 +253,11 @@ pub async fn get_resize_image_prefixed(
  )]
 #[get("/images/{img_guid}/")]
 pub async fn get_original_image_prefixed(
+    req: HttpRequest,
     path: web::Path<String>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
     client: web::Data<Client>,
 ) -> Result<HttpResponse, ApiError> {
-    let guid = path.into_inner();
-    let (bytes, ct) = get_resize_image_bytes(
-        &guid,
-        None,
-        None,
-        Some("JPEG"),
-        Some("ffffff"),
-        &db,
-        &settings,
-        &client,
-    )
-    .await?;
-    Ok(HttpResponse::Ok().content_type(ct).body(bytes))
+    stream_original(req, path.into_inner(), db, settings, client).await
 }
