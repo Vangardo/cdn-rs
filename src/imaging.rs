@@ -72,15 +72,18 @@ fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiErro
     if rgb.width() == dst_w && rgb.height() == dst_h {
         return Ok(rgb);
     }
-    let ratio = (dst_w as f32 / rgb.width() as f32)
-        .min(dst_h as f32 / rgb.height() as f32);
-    let filter = if ratio < 0.5 {
-        fir::FilterType::Lanczos3
+    let filter = if dst_w.max(dst_h) >= 512 {
+        fir::FilterType::CatmullRom
     } else {
-        fir::FilterType::Bilinear
+        fir::FilterType::Box
     };
-    let src = FirImage::from_vec_u8(rgb.width(), rgb.height(), rgb.into_raw(), fir::PixelType::U8x3)
-        .map_err(|e| ApiError::Img(e.to_string()))?;
+    let src = FirImage::from_vec_u8(
+        rgb.width(),
+        rgb.height(),
+        rgb.into_raw(),
+        fir::PixelType::U8x3,
+    )
+    .map_err(|e| ApiError::Img(e.to_string()))?;
     let mut dst = FirImage::new(dst_w, dst_h, fir::PixelType::U8x3);
     let mut resizer = fir::Resizer::new();
     let opts = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(filter));
@@ -213,6 +216,37 @@ fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
     }
 }
 
+pub fn variant_disk_path(
+    settings: &Settings,
+    guid: Uuid,
+    width: Option<u32>,
+    height: Option<u32>,
+    fmt: Option<&str>,
+    bg_hex: Option<&str>,
+) -> (String, String) {
+    let fmt_upper = fmt.unwrap_or("JPEG").to_ascii_uppercase();
+    let (fmt_word, ext, ct) = match fmt_upper.as_str() {
+        "PNG" => ("png", "png", "image/png"),
+        "GIF" => ("gif", "gif", "image/gif"),
+        "TIFF" => ("tiff", "tiff", "image/tiff"),
+        "WEBP" => ("webp", "webp", "image/webp"),
+        _ => ("jpeg", "jpg", "image/jpeg"),
+    };
+    let bg = bg_hex.unwrap_or("ffffff").to_lowercase();
+    let path = format!(
+        "{}variants/{}/{w}x{h}_{bg}_{fmt_word}_q{q}.{ext}",
+        settings.media_base_dir,
+        guid,
+        w = width.unwrap_or(0),
+        h = height.unwrap_or(0),
+        bg = bg,
+        fmt_word = fmt_word,
+        q = JPEG_Q as u8,
+        ext = ext
+    );
+    (path, ct.to_string())
+}
+
 /// Точный аналог Python get_resize_image (с фолбэком и даунлоадом по link_o)
 pub async fn get_resize_image_bytes(
     guid_or_slug: &str,
@@ -227,14 +261,45 @@ pub async fn get_resize_image_bytes(
 ) -> Result<(Vec<u8>, String), ApiError> {
     let started = Instant::now();
 
-    // Разбираем guid
     let guid = if util::is_guid(guid_or_slug) {
         util::parse_guid(guid_or_slug).ok_or(ApiError::BadRequest("invalid guid".into()))?
     } else {
-        // no-image
-        // поведение Python: если не GUID — берём no-image
         Uuid::nil()
     };
+
+    let bg_hex_owned = bg_hex.map(|s| s.to_string());
+    let fmt_owned = format.map(|f| f.to_ascii_uppercase());
+
+    let cache_key = format!(
+        "img:{}:{}:{}:{}:{}",
+        guid_or_slug,
+        width.unwrap_or(0),
+        height.unwrap_or(0),
+        fmt_owned.as_deref().unwrap_or("JPEG"),
+        bg_hex_owned.as_deref().unwrap_or("ffffff"),
+    );
+
+    let (disk_path, ct_guess) = variant_disk_path(
+        settings,
+        guid,
+        width,
+        height,
+        fmt_owned.as_deref(),
+        bg_hex_owned.as_deref(),
+    );
+
+    if let Ok(bytes) = tokio_fs::read(&disk_path).await {
+        tracing::info!(disk_cache = "HIT", path = %disk_path);
+        let _ = cache.insert_with_ttl(&cache_key, &bytes, 3600, 10000).await;
+        return Ok((bytes, ct_guess));
+    }
+    tracing::info!(disk_cache = "MISS", path = %disk_path);
+
+    if let Ok(Some(bytes)) = cache.get(&cache_key).await {
+        tracing::info!(cache = "HIT", key = %cache_key);
+        return Ok((bytes, ct_guess));
+    }
+    tracing::info!(cache = "MISS", key = %cache_key);
 
     let input_path = if guid.is_nil() {
         settings.no_image_full_path()
@@ -253,29 +318,6 @@ pub async fn get_resize_image_bytes(
 
     let no_image_path = settings.no_image_full_path();
     let max_side = settings.max_image_side;
-    let bg_hex_owned = bg_hex.map(|s| s.to_string());
-    let fmt_owned = format.map(|f| f.to_ascii_uppercase());
-
-    let cache_key = format!(
-        "img:{}:{}:{}:{}:{}",
-        guid_or_slug,
-        width.unwrap_or(0),
-        height.unwrap_or(0),
-        fmt_owned.as_deref().unwrap_or("JPEG"),
-        bg_hex_owned.as_deref().unwrap_or("ffffff"),
-    );
-
-    if let Ok(Some(bytes)) = cache.get(&cache_key).await {
-        let ct = match fmt_owned.as_deref() {
-            Some("PNG") => "image/png",
-            Some("GIF") => "image/gif",
-            Some("TIFF") => "image/tiff",
-            Some("WEBP") => "image/webp",
-            _ => "image/jpeg",
-        }
-        .to_string();
-        return Ok((bytes, ct));
-    }
 
     if width.is_none()
         && height.is_none()
@@ -288,10 +330,16 @@ pub async fn get_resize_image_bytes(
             .unwrap_or(true)
     {
         if let Some(buf) = downloaded {
-            let _ = cache
-                .insert_with_ttl(&cache_key, &buf, 900, 500)
-                .await;
-            return Ok((buf, "image/jpeg".to_string()));
+            let _ = cache.insert_with_ttl(&cache_key, &buf, 3600, 10000).await;
+            ensure_dir(&disk_path).map_err(|e| ApiError::Io(e.to_string()))?;
+            let tmp = format!("{disk_path}.tmp-{}", Uuid::new_v4());
+            tokio_fs::write(&tmp, &buf)
+                .await
+                .map_err(|e| ApiError::Io(e.to_string()))?;
+            tokio_fs::rename(&tmp, &disk_path)
+                .await
+                .map_err(|e| ApiError::Io(e.to_string()))?;
+            return Ok((buf, ct_guess));
         }
         let path = if Path::new(&input_path).exists() {
             input_path
@@ -301,10 +349,16 @@ pub async fn get_resize_image_bytes(
         let buf = tokio_fs::read(&path)
             .await
             .map_err(|e| ApiError::Io(e.to_string()))?;
-        let _ = cache
-            .insert_with_ttl(&cache_key, &buf, 900, 500)
-            .await;
-        return Ok((buf, "image/jpeg".to_string()));
+        let _ = cache.insert_with_ttl(&cache_key, &buf, 3600, 10000).await;
+        ensure_dir(&disk_path).map_err(|e| ApiError::Io(e.to_string()))?;
+        let tmp = format!("{disk_path}.tmp-{}", Uuid::new_v4());
+        tokio_fs::write(&tmp, &buf)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+        tokio_fs::rename(&tmp, &disk_path)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+        return Ok((buf, ct_guess));
     }
 
     let permit = BLOCKING_SEM.acquire().await.unwrap();
@@ -351,8 +405,8 @@ pub async fn get_resize_image_bytes(
             started
                 .read_scanlines_into(&mut buf)
                 .map_err(|e| ApiError::Img(e.to_string()))?;
-            let base = RgbImage::from_raw(dw, dh, buf)
-                .ok_or_else(|| ApiError::Img("bad rgb".into()))?;
+            let base =
+                RgbImage::from_raw(dw, dh, buf).ok_or_else(|| ApiError::Img("bad rgb".into()))?;
             let rgb = if need_resize {
                 fir_resize(base, fg_w, fg_h)?
             } else {
@@ -361,11 +415,7 @@ pub async fn get_resize_image_bytes(
             (rgb, tw, th)
         } else {
             let img = if data.is_empty() {
-                DynamicImage::ImageRgb8(RgbImage::from_pixel(
-                    1,
-                    1,
-                    image::Rgb([255, 255, 255]),
-                ))
+                DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
             } else {
                 image::load_from_memory(&data).map_err(|e| ApiError::Img(e.to_string()))?
             };
@@ -440,9 +490,16 @@ pub async fn get_resize_image_bytes(
     .map_err(|_| ApiError::Internal)??;
     drop(permit);
 
-    let _ = cache
-        .insert_with_ttl(&cache_key, &buf, 900, 500)
-        .await;
+    ensure_dir(&disk_path).map_err(|e| ApiError::Io(e.to_string()))?;
+    let tmp = format!("{disk_path}.tmp-{}", Uuid::new_v4());
+    tokio_fs::write(&tmp, &buf)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+    tokio_fs::rename(&tmp, &disk_path)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+
+    let _ = cache.insert_with_ttl(&cache_key, &buf, 3600, 10000).await;
 
     tracing::info!(
         "get_resize_image_bytes took {}ms",

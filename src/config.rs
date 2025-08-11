@@ -23,16 +23,16 @@ impl Settings {
     pub fn from_env() -> Self {
         dotenv().ok();
         let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-        let media_base_dir = env::var("MEDIA_BASE_DIR")
-            .unwrap_or_else(|_| "/images/".into());
+        let media_base_dir = env::var("MEDIA_BASE_DIR").unwrap_or_else(|_| "/images/".into());
         let no_image_file = env::var("NO_IMAGE_FILE").unwrap_or_else(|_| "no-image-01.jpg".into());
         let max_image_side = env::var("MAX_IMAGE_SIDE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1600);
 
-        let database_url = env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:0X90uyyz8QKMmV7jlJiQ@65.21.189.170:5432/tradeshow".into());
+        let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:0X90uyyz8QKMmV7jlJiQ@65.21.189.170:5432/tradeshow".into()
+        });
 
         let use_cache = env::var("USE_CACHE")
             .map(|s| s == "true" || s == "1")
