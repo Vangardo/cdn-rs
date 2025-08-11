@@ -356,8 +356,8 @@ pub async fn get_resize_image_bytes(
         };
 
         // Оптимизация: убираем лишнее клонирование
-        let try_mozjpeg = Decompress::new_mem(&data);
-        let (mut rgb, tw, th) = if let Ok(mut d) = try_mozjpeg {
+        let mut early_ct: Option<String> = None;
+        let (mut rgb, tw, th) = if let Ok(mut d) = Decompress::new_mem(&data) {
             let (sw, sh) = (d.width() as u32, d.height() as u32);
             let (tw, th, fg_w, fg_h, need_resize) =
                 target_and_foreground(sw, sh, width, height, max_side);
@@ -376,25 +376,26 @@ pub async fn get_resize_image_bytes(
                     .unwrap_or(true)
             {
                 drop(d);
-                return Ok((data, "image/jpeg".to_string()));
-            }
-
-            let denom = choose_dct_denom(sw, sh, fg_w, fg_h);
-            d.set_scale(1, denom as u32);
-            let mut started = d.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
-            let (dw, dh) = (started.width() as u32, started.height() as u32);
-            let mut buf = vec![0u8; (dw * dh * 3) as usize];
-            started
-                .read_scanlines_into(&mut buf)
-                .map_err(|e| ApiError::Img(e.to_string()))?;
-            let base =
-                RgbImage::from_raw(dw, dh, buf).ok_or_else(|| ApiError::Img("bad rgb".into()))?;
-            let rgb = if need_resize {
-                fir_resize(base, fg_w, fg_h)?
+                early_ct = Some("image/jpeg".to_string());
+                (RgbImage::new(0, 0), 0, 0)
             } else {
-                base
-            };
-            (rgb, tw, th)
+                let denom = choose_dct_denom(sw, sh, fg_w, fg_h);
+                d.set_scale(1, denom as u32);
+                let mut started = d.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
+                let (dw, dh) = (started.width() as u32, started.height() as u32);
+                let mut buf = vec![0u8; (dw * dh * 3) as usize];
+                started
+                    .read_scanlines_into(&mut buf)
+                    .map_err(|e| ApiError::Img(e.to_string()))?;
+                let base = RgbImage::from_raw(dw, dh, buf)
+                    .ok_or_else(|| ApiError::Img("bad rgb".into()))?;
+                let rgb = if need_resize {
+                    fir_resize(base, fg_w, fg_h)?
+                } else {
+                    base
+                };
+                (rgb, tw, th)
+            }
         } else {
             let img = if data.is_empty() {
                 DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
@@ -412,6 +413,10 @@ pub async fn get_resize_image_bytes(
             };
             (rgb, tw, th)
         };
+
+        if let Some(ct) = early_ct {
+            return Ok((data, ct));
+        }
 
         let bg_is_default = bg_hex_owned
             .as_deref()
