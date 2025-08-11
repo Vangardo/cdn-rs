@@ -3,12 +3,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use fast_image_resize::{self as fir, images::Image as FirImage};
 use image::imageops;
-use image::{self, DynamicImage, GenericImageView, ImageFormat, RgbImage};
-use mozjpeg::{ColorSpace, Compress};
+use image::{self, DynamicImage, ImageFormat, RgbImage};
+use mozjpeg::{ColorSpace, Compress, Decompress};
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use std::{fs, io::Cursor, path::Path, time::Instant};
-use tokio::{fs as tokio_fs, task};
+use tokio::{fs as tokio_fs, sync::Semaphore, task};
 use uuid::Uuid;
+
+static BLOCKING_SEM: Lazy<Semaphore> =
+    Lazy::new(|| Semaphore::new(num_cpus::get().saturating_sub(1).max(1)));
 
 fn ensure_dir(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
@@ -84,12 +88,28 @@ pub async fn convert_and_save_jpg(
         .decode(base64_img)
         .map_err(|e| ApiError::BadRequest(format!("invalid base64: {}", e)))?;
 
+    let permit = BLOCKING_SEM.acquire().await.unwrap();
     task::spawn_blocking(move || -> Result<(), ApiError> {
-        let img = image::load_from_memory(&decoded).map_err(|e| ApiError::Img(e.to_string()))?;
-        let rgb = img.to_rgb8();
+        let rgb = match Decompress::new_mem(&decoded) {
+            Ok(dec) => {
+                let mut dec = dec.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
+                let w = dec.width() as u32;
+                let h = dec.height() as u32;
+                let mut data = vec![0u8; (w * h * 3) as usize];
+                dec.read_scanlines_into(&mut data)
+                    .map_err(|e| ApiError::Img(e.to_string()))?;
+                RgbImage::from_raw(w, h, data)
+                    .ok_or_else(|| ApiError::Img("decode failed".into()))?
+            }
+            Err(_) => image::load_from_memory(&decoded)
+                .map_err(|e| ApiError::Img(e.to_string()))?
+                .to_rgb8(),
+        };
         let mut comp = Compress::new(ColorSpace::JCS_RGB);
         comp.set_size(rgb.width() as usize, rgb.height() as usize);
         comp.set_quality(85.0);
+        comp.set_optimize_scans(false);
+        comp.set_optimize_coding(false);
         let mut comp = comp
             .start_compress(Vec::new())
             .map_err(|e| ApiError::Img(e.to_string()))?;
@@ -101,6 +121,7 @@ pub async fn convert_and_save_jpg(
     })
     .await
     .map_err(|_| ApiError::Internal)??;
+    drop(permit);
 
     db.update_image_status(id, 4).await?;
     tracing::info!(
@@ -194,56 +215,112 @@ pub async fn get_resize_image_bytes(
         return Ok((buf, "image/jpeg".to_string()));
     }
 
+    let permit = BLOCKING_SEM.acquire().await.unwrap();
     let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
-        let img = if let Some(b) = downloaded {
-            image::load_from_memory(&b).map_err(|e| ApiError::Img(e.to_string()))?
+        let calc_target = |orig_w: u32, orig_h: u32| -> (u32, u32) {
+            let (mut tw, mut th) = match (width, height) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => {
+                    let scale = w as f32 / orig_w.max(1) as f32;
+                    (w, ((orig_h as f32 * scale).round() as u32).max(1))
+                }
+                (None, Some(hh)) => {
+                    let scale = hh as f32 / orig_h.max(1) as f32;
+                    (((orig_w as f32 * scale).round() as u32).max(1), hh)
+                }
+                (None, None) => (orig_w, orig_h),
+            };
+            if tw > max_side {
+                tw = max_side;
+            }
+            if th > max_side {
+                th = max_side;
+            }
+            (tw, th)
+        };
+
+        let mut rgb: RgbImage;
+        let mut target_w;
+        let mut target_h;
+
+        let data = if let Some(b) = downloaded {
+            b
+        } else if let Ok(bytes) = fs::read(&input_path) {
+            bytes
+        } else if let Ok(bytes) = fs::read(&no_image_path) {
+            bytes
         } else {
-            image::open(&input_path)
-                .or_else(|_| image::open(&no_image_path))
-                .unwrap_or_else(|_| {
-                    let img = RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255]));
-                    DynamicImage::ImageRgb8(img)
-                })
+            Vec::new()
         };
 
-        let (orig_w, orig_h) = img.dimensions();
-        let (mut target_w, mut target_h) = match (width, height) {
-            (Some(w), Some(h)) => (w, h),
-            (Some(w), None) => {
-                let scale = w as f32 / orig_w.max(1) as f32;
-                (w, ((orig_h as f32 * scale).round() as u32).max(1))
+        if let Ok(mut dec) = Decompress::new_mem(&data) {
+            let orig_w = dec.width() as u32;
+            let orig_h = dec.height() as u32;
+            (target_w, target_h) = calc_target(orig_w, orig_h);
+            let mut scale_num = 8u8;
+            for s in [1u8, 2, 4, 8] {
+                if (orig_w as u64 * s as u64 / 8) >= target_w as u64
+                    && (orig_h as u64 * s as u64 / 8) >= target_h as u64
+                {
+                    scale_num = s;
+                    break;
+                }
             }
-            (None, Some(hh)) => {
-                let scale = hh as f32 / orig_h.max(1) as f32;
-                (((orig_w as f32 * scale).round() as u32).max(1), hh)
-            }
-            (None, None) => (orig_w, orig_h),
-        };
-
-        if target_w > max_side {
-            target_w = max_side;
-        }
-        if target_h > max_side {
-            target_h = max_side;
-        }
-
-        let mut rgb = img.to_rgb8();
-        if width.is_some() || height.is_some() {
-            let src_image =
-                FirImage::from_vec_u8(orig_w, orig_h, rgb.into_raw(), fir::PixelType::U8x3)
-                    .map_err(|e| ApiError::Img(e.to_string()))?;
-            let mut dst_image = FirImage::new(target_w, target_h, fir::PixelType::U8x3);
-            let mut resizer = fir::Resizer::new();
-            let options = fir::ResizeOptions::new()
-                .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Box));
-            resizer
-                .resize(&src_image, &mut dst_image, &options)
+            dec.scale(scale_num);
+            let mut dec = dec.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
+            let src_w = dec.width() as u32;
+            let src_h = dec.height() as u32;
+            let mut data_buf = vec![0u8; (src_w * src_h * 3) as usize];
+            dec.read_scanlines_into(&mut data_buf)
                 .map_err(|e| ApiError::Img(e.to_string()))?;
-            rgb = RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
-                .ok_or_else(|| ApiError::Img("resize failed".into()))?;
+            rgb = RgbImage::from_raw(src_w, src_h, data_buf)
+                .ok_or_else(|| ApiError::Img("decode failed".into()))?;
+            if width.is_some() || height.is_some() {
+                let src_image =
+                    FirImage::from_vec_u8(src_w, src_h, rgb.into_raw(), fir::PixelType::U8x3)
+                        .map_err(|e| ApiError::Img(e.to_string()))?;
+                let mut dst_image = FirImage::new(target_w, target_h, fir::PixelType::U8x3);
+                let mut resizer = fir::Resizer::new();
+                let options = fir::ResizeOptions::new()
+                    .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Box));
+                resizer
+                    .resize(&src_image, &mut dst_image, &options)
+                    .map_err(|e| ApiError::Img(e.to_string()))?;
+                rgb = RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
+                    .ok_or_else(|| ApiError::Img("resize failed".into()))?;
+            } else {
+                target_w = src_w;
+                target_h = src_h;
+            }
         } else {
-            target_w = orig_w;
-            target_h = orig_h;
+            let img = if data.is_empty() {
+                DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
+            } else {
+                image::load_from_memory(&data).map_err(|e| ApiError::Img(e.to_string()))?
+            };
+            let orig_w = img.width();
+            let orig_h = img.height();
+            (target_w, target_h) = calc_target(orig_w, orig_h);
+            let src_w = orig_w;
+            let src_h = orig_h;
+            rgb = img.to_rgb8();
+            if width.is_some() || height.is_some() {
+                let src_image =
+                    FirImage::from_vec_u8(src_w, src_h, rgb.into_raw(), fir::PixelType::U8x3)
+                        .map_err(|e| ApiError::Img(e.to_string()))?;
+                let mut dst_image = FirImage::new(target_w, target_h, fir::PixelType::U8x3);
+                let mut resizer = fir::Resizer::new();
+                let options = fir::ResizeOptions::new()
+                    .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Box));
+                resizer
+                    .resize(&src_image, &mut dst_image, &options)
+                    .map_err(|e| ApiError::Img(e.to_string()))?;
+                rgb = RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
+                    .ok_or_else(|| ApiError::Img("resize failed".into()))?;
+            } else {
+                target_w = src_w;
+                target_h = src_h;
+            }
         }
 
         let bg_is_default = bg_hex_owned
@@ -272,6 +349,8 @@ pub async fn get_resize_image_bytes(
                 let mut comp = Compress::new(ColorSpace::JCS_RGB);
                 comp.set_size(target_w as usize, target_h as usize);
                 comp.set_quality(85.0);
+                comp.set_optimize_scans(false);
+                comp.set_optimize_coding(false);
                 let mut comp = comp
                     .start_compress(Vec::new())
                     .map_err(|e| ApiError::Img(e.to_string()))?;
@@ -300,6 +379,7 @@ pub async fn get_resize_image_bytes(
     })
     .await
     .map_err(|_| ApiError::Internal)??;
+    drop(permit);
 
     tracing::info!(
         "get_resize_image_bytes took {}ms",
