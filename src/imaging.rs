@@ -35,17 +35,60 @@ fn ensure_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn choose_denom(src_w: u32, src_h: u32, tgt_w: u32, tgt_h: u32) -> u32 {
-    let r = (src_w as f32 / tgt_w.max(1) as f32).max(src_h as f32 / tgt_h.max(1) as f32);
-    if r >= 7.0 {
-        8
-    } else if r >= 3.0 {
-        4
-    } else if r >= 1.5 {
-        2
-    } else {
-        1
+fn target_and_foreground(
+    orig_w: u32,
+    orig_h: u32,
+    req_w: Option<u32>,
+    req_h: Option<u32>,
+    max_side: u32,
+) -> (u32, u32, u32, u32, bool) {
+    // рамка (target)
+    let mut tw = req_w.unwrap_or(orig_w).min(max_side);
+    let mut th = req_h.unwrap_or(orig_h).min(max_side);
+    if req_w.is_none() && req_h.is_none() {
+        tw = orig_w.min(max_side);
+        th = orig_h.min(max_side);
     }
+    // вписывание + баним апскейл
+    let r = (tw as f32 / orig_w as f32)
+        .min(th as f32 / orig_h as f32)
+        .min(1.0);
+    let fg_w = ((orig_w as f32 * r).round() as u32).max(1);
+    let fg_h = ((orig_h as f32 * r).round() as u32).max(1);
+    (tw, th, fg_w, fg_h, r < 1.0)
+}
+
+fn choose_dct_denom(sw: u32, sh: u32, fg_w: u32, fg_h: u32) -> u8 {
+    // хотим после DCT-скейла иметь >= fg_w×fg_h (чтобы дальше ТОЛЬКО даунскейл)
+    for &den in &[8u8, 4, 2, 1] {
+        if sw / den as u32 >= fg_w && sh / den as u32 >= fg_h {
+            return den;
+        }
+    }
+    1
+}
+
+fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiError> {
+    if rgb.width() == dst_w && rgb.height() == dst_h {
+        return Ok(rgb);
+    }
+    let ratio = (dst_w as f32 / rgb.width() as f32)
+        .min(dst_h as f32 / rgb.height() as f32);
+    let filter = if ratio < 0.5 {
+        fir::FilterType::Lanczos3
+    } else {
+        fir::FilterType::Bilinear
+    };
+    let src = FirImage::from_vec_u8(rgb.width(), rgb.height(), rgb.into_raw(), fir::PixelType::U8x3)
+        .map_err(|e| ApiError::Img(e.to_string()))?;
+    let mut dst = FirImage::new(dst_w, dst_h, fir::PixelType::U8x3);
+    let mut resizer = fir::Resizer::new();
+    let opts = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(filter));
+    resizer
+        .resize(&src, &mut dst, &opts)
+        .map_err(|e| ApiError::Img(e.to_string()))?;
+    RgbImage::from_raw(dst_w, dst_h, dst.into_vec())
+        .ok_or_else(|| ApiError::Img("resize failed".into()))
 }
 
 fn normalize_onlihub_extensions(mut url: String) -> String {
@@ -170,12 +213,6 @@ fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
     }
 }
 
-fn place_center(bg_w: u32, bg_h: u32, fg_w: u32, fg_h: u32) -> (u32, u32) {
-    let x = ((bg_w as i64 - fg_w as i64) / 2).max(0) as u32;
-    let y = ((bg_h as i64 - fg_h as i64) / 2).max(0) as u32;
-    (x, y)
-}
-
 /// Точный аналог Python get_resize_image (с фолбэком и даунлоадом по link_o)
 pub async fn get_resize_image_bytes(
     guid_or_slug: &str,
@@ -244,32 +281,6 @@ pub async fn get_resize_image_bytes(
 
     let permit = BLOCKING_SEM.acquire().await.unwrap();
     let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
-        let calc_target = |orig_w: u32, orig_h: u32| -> (u32, u32) {
-            let (mut tw, mut th) = match (width, height) {
-                (Some(w), Some(h)) => (w, h),
-                (Some(w), None) => {
-                    let scale = w as f32 / orig_w.max(1) as f32;
-                    (w, ((orig_h as f32 * scale).round() as u32).max(1))
-                }
-                (None, Some(hh)) => {
-                    let scale = hh as f32 / orig_h.max(1) as f32;
-                    (((orig_w as f32 * scale).round() as u32).max(1), hh)
-                }
-                (None, None) => (orig_w, orig_h),
-            };
-            if tw > max_side {
-                tw = max_side;
-            }
-            if th > max_side {
-                th = max_side;
-            }
-            (tw, th)
-        };
-
-        let mut rgb: RgbImage;
-        let mut target_w;
-        let mut target_h;
-
         let data = if let Some(b) = downloaded {
             b
         } else if let Ok(bytes) = fs::read(&input_path) {
@@ -280,74 +291,78 @@ pub async fn get_resize_image_bytes(
             Vec::new()
         };
 
-        if let Ok(mut dec) = Decompress::new_mem(&data) {
-            let orig_w = dec.width() as u32;
-            let orig_h = dec.height() as u32;
-            (target_w, target_h) = calc_target(orig_w, orig_h);
-            let denom = choose_denom(orig_w, orig_h, target_w, target_h);
-            dec.set_scale(1, denom);
-            let mut dec = dec.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
-            let src_w = dec.width() as u32;
-            let src_h = dec.height() as u32;
-            let mut data_buf = vec![0u8; (src_w * src_h * 3) as usize];
-            dec.read_scanlines_into(&mut data_buf)
-                .map_err(|e| ApiError::Img(e.to_string()))?;
-            rgb = RgbImage::from_raw(src_w, src_h, data_buf)
-                .ok_or_else(|| ApiError::Img("decode failed".into()))?;
-            if src_w != target_w || src_h != target_h {
-                let src_image =
-                    FirImage::from_vec_u8(src_w, src_h, rgb.into_raw(), fir::PixelType::U8x3)
-                        .map_err(|e| ApiError::Img(e.to_string()))?;
-                let mut dst_image = FirImage::new(target_w, target_h, fir::PixelType::U8x3);
-                let mut resizer = fir::Resizer::new();
-                let options = fir::ResizeOptions::new()
-                    .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Box));
-                resizer
-                    .resize(&src_image, &mut dst_image, &options)
-                    .map_err(|e| ApiError::Img(e.to_string()))?;
-                rgb = RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
-                    .ok_or_else(|| ApiError::Img("resize failed".into()))?;
+        let orig_data = data.clone();
+        let try_mozjpeg = Decompress::new_mem(&data);
+        let (mut rgb, tw, th) = if let Ok(mut d) = try_mozjpeg {
+            let (sw, sh) = (d.width() as u32, d.height() as u32);
+            let (tw, th, fg_w, fg_h, need_resize) =
+                target_and_foreground(sw, sh, width, height, max_side);
+
+            if (width.is_some() || height.is_some())
+                && fg_w == sw
+                && fg_h == sh
+                && tw == sw
+                && th == sh
+                && fmt_owned
+                    .as_deref()
+                    .map_or(true, |f| f.eq_ignore_ascii_case("JPEG"))
+                && bg_hex_owned
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case("ffffff"))
+                    .unwrap_or(true)
+            {
+                drop(d);
+                return Ok((orig_data, "image/jpeg".to_string()));
             }
+
+            let denom = choose_dct_denom(sw, sh, fg_w, fg_h);
+            d.set_scale(1, denom as u32);
+            let mut started = d.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
+            let (dw, dh) = (started.width() as u32, started.height() as u32);
+            let mut buf = vec![0u8; (dw * dh * 3) as usize];
+            started
+                .read_scanlines_into(&mut buf)
+                .map_err(|e| ApiError::Img(e.to_string()))?;
+            let base = RgbImage::from_raw(dw, dh, buf)
+                .ok_or_else(|| ApiError::Img("bad rgb".into()))?;
+            let rgb = if need_resize {
+                fir_resize(base, fg_w, fg_h)?
+            } else {
+                base
+            };
+            (rgb, tw, th)
         } else {
             let img = if data.is_empty() {
-                DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
+                DynamicImage::ImageRgb8(RgbImage::from_pixel(
+                    1,
+                    1,
+                    image::Rgb([255, 255, 255]),
+                ))
             } else {
                 image::load_from_memory(&data).map_err(|e| ApiError::Img(e.to_string()))?
             };
-            let orig_w = img.width();
-            let orig_h = img.height();
-            (target_w, target_h) = calc_target(orig_w, orig_h);
-            let src_w = orig_w;
-            let src_h = orig_h;
-            rgb = img.to_rgb8();
-            if width.is_some() || height.is_some() {
-                let src_image =
-                    FirImage::from_vec_u8(src_w, src_h, rgb.into_raw(), fir::PixelType::U8x3)
-                        .map_err(|e| ApiError::Img(e.to_string()))?;
-                let mut dst_image = FirImage::new(target_w, target_h, fir::PixelType::U8x3);
-                let mut resizer = fir::Resizer::new();
-                let options = fir::ResizeOptions::new()
-                    .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Box));
-                resizer
-                    .resize(&src_image, &mut dst_image, &options)
-                    .map_err(|e| ApiError::Img(e.to_string()))?;
-                rgb = RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
-                    .ok_or_else(|| ApiError::Img("resize failed".into()))?;
+            let (sw, sh) = (img.width(), img.height());
+            let (tw, th, fg_w, fg_h, need_resize) =
+                target_and_foreground(sw, sh, width, height, max_side);
+            let base = img.to_rgb8();
+            let rgb = if need_resize {
+                fir_resize(base, fg_w, fg_h)?
             } else {
-                target_w = src_w;
-                target_h = src_h;
-            }
-        }
+                base
+            };
+            (rgb, tw, th)
+        };
 
         let bg_is_default = bg_hex_owned
             .as_deref()
             .unwrap_or("ffffff")
             .eq_ignore_ascii_case("ffffff");
-        if rgb.width() != target_w || rgb.height() != target_h || !bg_is_default {
+        if rgb.width() != tw || rgb.height() != th || !bg_is_default {
             let (r, g, b) = hex_to_rgb(bg_hex_owned.as_deref().unwrap_or("ffffff"));
-            let mut bg = RgbImage::from_pixel(target_w, target_h, image::Rgb([r, g, b]));
-            let (x, y) = place_center(target_w, target_h, rgb.width(), rgb.height());
-            imageops::replace(&mut bg, &rgb, x as i64, y as i64);
+            let mut bg = RgbImage::from_pixel(tw, th, image::Rgb([r, g, b]));
+            let x = ((tw - rgb.width()) / 2) as i64;
+            let y = ((th - rgb.height()) / 2) as i64;
+            imageops::replace(&mut bg, &rgb, x, y);
             rgb = bg;
         }
 
@@ -363,7 +378,7 @@ pub async fn get_resize_image_bytes(
         match fmt {
             ImageFormat::Jpeg => {
                 let mut comp = Compress::new(ColorSpace::JCS_RGB);
-                comp.set_size(target_w as usize, target_h as usize);
+                comp.set_size(tw as usize, th as usize);
                 comp.set_quality(JPEG_Q);
                 comp.set_optimize_scans(false);
                 comp.set_optimize_coding(false);
