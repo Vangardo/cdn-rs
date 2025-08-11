@@ -1,8 +1,10 @@
 use crate::{config::Settings, db::Db, errors::ApiError, proxy, util};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use image::codecs::jpeg::JpegEncoder;
-use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
+use fast_image_resize::{self as fir, images::Image as FirImage};
+use image::{self, DynamicImage, GenericImageView, ImageFormat, RgbImage};
+use image::imageops;
+use mozjpeg::{ColorSpace, Compress};
 use reqwest::Client;
 use std::{fs, io::Cursor, path::Path, time::Instant};
 use tokio::{fs as tokio_fs, task};
@@ -95,13 +97,16 @@ pub async fn convert_and_save_jpg(
     task::spawn_blocking(move || -> Result<(), ApiError> {
         let img = image::load_from_memory(&decoded).map_err(|e| ApiError::Img(e.to_string()))?;
         let rgb = img.to_rgb8();
-        let mut buf = Vec::new();
-        {
-            let mut cursor = Cursor::new(&mut buf);
-            JpegEncoder::new_with_quality(&mut cursor, 85)
-                .encode_image(&rgb)
-                .map_err(|e| ApiError::Img(e.to_string()))?;
-        }
+        let mut comp = Compress::new(ColorSpace::JCS_RGB);
+        comp.set_size(rgb.width() as usize, rgb.height() as usize);
+        comp.set_quality(85.0);
+        let mut comp = comp
+            .start_compress(Vec::new())
+            .map_err(|e| ApiError::Img(e.to_string()))?;
+        comp
+            .write_scanlines(&rgb)
+            .map_err(|e| ApiError::Img(e.to_string()))?;
+        let buf = comp.finish().map_err(|e| ApiError::Img(e.to_string()))?;
         fs::write(&out_path, &buf).map_err(|e| ApiError::Io(e.to_string()))?;
         Ok(())
     })
@@ -111,15 +116,6 @@ pub async fn convert_and_save_jpg(
     db.update_image_status(id, 4).await?;
     tracing::info!("convert_and_save_jpg took {}ms", started.elapsed().as_millis());
     Ok((id, guid))
-}
-
-fn fit_to_box(img: &DynamicImage, width: u32, height: u32) -> DynamicImage {
-    // аккуратно вписываем в рамку с сохранением пропорций
-    img.resize_to_fill(width, height, FilterType::Triangle)
-}
-
-fn fit_inside(img: &DynamicImage, max_w: u32, max_h: u32) -> DynamicImage {
-    img.resize(max_w, max_h, FilterType::CatmullRom)
 }
 
 fn hex_to_rgb(hex: &str) -> (u8, u8, u8) {
@@ -167,119 +163,119 @@ pub async fn get_resize_image_bytes(
         format!("{}{}.jpg", settings.media_base_dir, guid)
     };
 
-    // Попытка открыть локально; при неудаче — авто-даунлоад по link_o
-    let mut img = match task::spawn_blocking({
-        let input_path = input_path.clone();
-        move || image::open(&input_path)
-    })
-    .await
-    {
-        Ok(Ok(img)) => img,
-        _ => {
-            let open_no_image = || -> Result<DynamicImage, ApiError> {
-                match image::open(settings.no_image_full_path()) {
-                    Ok(img) => Ok(img),
-                    Err(_) => {
-                        let img = RgbaImage::from_pixel(1, 1, Rgba([255, 255, 255, 255]));
-                        Ok(DynamicImage::ImageRgba8(img))
-                    }
-                }
-            };
-            if !guid.is_nil() {
-                if let Some(link) = db.get_original_link_by_guid(guid).await? {
-                    let _ = save_img_from_url(&link, &input_path, settings).await;
-                    match task::spawn_blocking({
-                        let input_path = input_path.clone();
-                        move || image::open(&input_path)
-                    })
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    {
-                        Some(img) => img,
-                        None => open_no_image()?,
-                    }
-                } else {
-                    open_no_image()?
-                }
-            } else {
-                open_no_image()?
-            }
+    if !Path::new(&input_path).exists() && !guid.is_nil() {
+        if let Some(link) = db.get_original_link_by_guid(guid).await? {
+            let _ = save_img_from_url(&link, &input_path, settings).await;
         }
-    };
+    }
 
-    // Определяем рамку
-    let (w, h) = img.dimensions();
-    let (mut target_w, mut target_h) = match (width, height) {
-        (Some(w), Some(h)) => (w, h),
-        (Some(w), None) => {
-            let scale = w as f32 / w.max(1) as f32;
-            ((w), ((h as f32 * scale) as u32).max(1))
-        }
-        (None, Some(hh)) => {
-            let scale = hh as f32 / h.max(1) as f32;
-            (((w as f32 * scale) as u32).max(1), hh)
-        }
-        (None, None) => (w, h),
-    };
-
-    // Лимиты (как в Python)
+    let no_image_path = settings.no_image_full_path();
     let max_side = settings.max_image_side;
-    if target_w > max_side {
-        target_w = max_side;
-    }
-    if target_h > max_side {
-        target_h = max_side;
-    }
+    let bg_hex_owned = bg_hex.map(|s| s.to_string());
+    let fmt_owned = format.map(|f| f.to_ascii_uppercase());
 
-    if width.is_some() || height.is_some() {
-        // вписываем внутрь рамки (без выхода за пределы)
-        img = fit_inside(&img, target_w, target_h);
-    }
-    let (fg_w, fg_h) = img.dimensions();
+    let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
+        let img = image::open(&input_path)
+            .or_else(|_| image::open(&no_image_path))
+            .unwrap_or_else(|_| {
+                let img = RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255]));
+                DynamicImage::ImageRgb8(img)
+            });
 
-    // Фон
-    let (r, g, b) = hex_to_rgb(bg_hex.unwrap_or("ffffff"));
-    let mut bg = RgbaImage::from_pixel(target_w, target_h, image::Rgba([r, g, b, 255]));
-    let (x, y) = place_center(target_w, target_h, fg_w, fg_h);
-    image::imageops::overlay(&mut bg, &img.to_rgba8(), x.into(), y.into());
-    let composed = DynamicImage::ImageRgba8(bg);
+        let (orig_w, orig_h) = img.dimensions();
+        let (mut target_w, mut target_h) = match (width, height) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => {
+                let scale = w as f32 / orig_w.max(1) as f32;
+                (w, ((orig_h as f32 * scale).round() as u32).max(1))
+            }
+            (None, Some(hh)) => {
+                let scale = hh as f32 / orig_h.max(1) as f32;
+                (((orig_w as f32 * scale).round() as u32).max(1), hh)
+            }
+            (None, None) => (orig_w, orig_h),
+        };
 
-    // Формат
-    let fmt = match format.map(|f| f.to_ascii_uppercase()) {
-        Some(ref s) if s == "PNG" => ImageFormat::Png,
-        Some(ref s) if s == "GIF" => ImageFormat::Gif,
-        Some(ref s) if s == "TIFF" => ImageFormat::Tiff,
-        Some(ref s) if s == "WEBP" => ImageFormat::WebP,
-        _ => ImageFormat::Jpeg,
-    };
+        if target_w > max_side {
+            target_w = max_side;
+        }
+        if target_h > max_side {
+            target_h = max_side;
+        }
 
-    let buf = task::spawn_blocking(move || -> Result<Vec<u8>, image::ImageError> {
+        let mut rgb = img.to_rgb8();
+        if width.is_some() || height.is_some() {
+            let src_image = FirImage::from_vec_u8(orig_w, orig_h, rgb.into_raw(), fir::PixelType::U8x3)
+                .map_err(|e| ApiError::Img(e.to_string()))?;
+            let mut dst_image = FirImage::new(target_w, target_h, fir::PixelType::U8x3);
+            let mut resizer = fir::Resizer::new();
+            let options = fir::ResizeOptions::new()
+                .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Box));
+            resizer
+                .resize(&src_image, &mut dst_image, &options)
+                .map_err(|e| ApiError::Img(e.to_string()))?;
+            rgb = RgbImage::from_raw(target_w, target_h, dst_image.into_vec())
+                .ok_or_else(|| ApiError::Img("resize failed".into()))?;
+        } else {
+            target_w = orig_w;
+            target_h = orig_h;
+        }
+
+        let bg_is_default = bg_hex_owned
+            .as_deref()
+            .unwrap_or("ffffff")
+            .eq_ignore_ascii_case("ffffff");
+        if rgb.width() != target_w || rgb.height() != target_h || !bg_is_default {
+            let (r, g, b) = hex_to_rgb(bg_hex_owned.as_deref().unwrap_or("ffffff"));
+            let mut bg = RgbImage::from_pixel(target_w, target_h, image::Rgb([r, g, b]));
+            let (x, y) = place_center(target_w, target_h, rgb.width(), rgb.height());
+            imageops::replace(&mut bg, &rgb, x as i64, y as i64);
+            rgb = bg;
+        }
+
+        let fmt = match fmt_owned.as_deref() {
+            Some("PNG") => ImageFormat::Png,
+            Some("GIF") => ImageFormat::Gif,
+            Some("TIFF") => ImageFormat::Tiff,
+            Some("WEBP") => ImageFormat::WebP,
+            _ => ImageFormat::Jpeg,
+        };
+
         let mut buf = Vec::new();
-        {
-            let mut cur = Cursor::new(&mut buf);
-            match fmt {
-                ImageFormat::Jpeg => {
-                    JpegEncoder::new_with_quality(&mut cur, 85).encode_image(&composed)?
-                }
-                other => composed.write_to(&mut cur, other)?,
+        match fmt {
+            ImageFormat::Jpeg => {
+                let mut comp = Compress::new(ColorSpace::JCS_RGB);
+                comp.set_size(target_w as usize, target_h as usize);
+                comp.set_quality(85.0);
+                let mut comp = comp
+                    .start_compress(Vec::new())
+                    .map_err(|e| ApiError::Img(e.to_string()))?;
+                comp
+                    .write_scanlines(&rgb)
+                    .map_err(|e| ApiError::Img(e.to_string()))?;
+                buf = comp.finish().map_err(|e| ApiError::Img(e.to_string()))?;
+            }
+            other => {
+                let mut cur = Cursor::new(&mut buf);
+                DynamicImage::ImageRgb8(rgb)
+                    .write_to(&mut cur, other)
+                    .map_err(|e| ApiError::Img(e.to_string()))?;
             }
         }
-        Ok(buf)
+
+        let ct = match fmt {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Gif => "image/gif",
+            ImageFormat::Tiff => "image/tiff",
+            ImageFormat::WebP => "image/webp",
+            _ => "image/jpeg",
+        }
+        .to_string();
+
+        Ok((buf, ct))
     })
     .await
-    .map_err(|_| ApiError::Internal)?
-    .map_err(|e| ApiError::Img(e.to_string()))?;
-
-    // content-type
-    let ct = match format.map(|f| f.to_ascii_lowercase()).as_deref() {
-        Some("png") => "image/png",
-        Some("gif") => "image/gif",
-        Some("tiff") => "image/tiff",
-        Some("webp") => "image/webp",
-        _ => "image/jpeg",
-    }
-    .to_string();
+    .map_err(|_| ApiError::Internal)??;
 
     tracing::info!("get_resize_image_bytes took {}ms", started.elapsed().as_millis());
     Ok((buf, ct))
