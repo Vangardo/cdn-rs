@@ -1,18 +1,18 @@
+mod cache;
 mod config;
 mod db;
 mod errors;
 mod imaging;
 mod models;
 mod openapi;
-mod cache;
 mod proxy;
 mod routes;
 mod util;
 
 use actix_web::{middleware::Logger, web, App, HttpServer};
+use cache::Cache;
 use config::Settings;
 use db::Db;
-use cache::Cache;
 use reqwest::Client;
 use tracing_subscriber::{fmt, EnvFilter};
 use utoipa::OpenApi;
@@ -40,12 +40,19 @@ async fn main() -> std::io::Result<()> {
     }
     let client = client_builder.build().expect("reqwest client build failed");
 
-    let cache = Cache::new(&settings.redis_url)
-        .await
-        .expect("redis connect failed");
+    let redis_url = settings.redis_url();
+    let cache = Cache::new(if settings.use_cache {
+        Some(&redis_url)
+    } else {
+        None
+    })
+    .await
+    .expect("redis connect failed");
 
     // OpenAPI
-    let openapi = openapi::ApiDoc::openapi();
+    let mut openapi = openapi::ApiDoc::openapi();
+    openapi.info.title = settings.swagger_title.clone();
+    openapi.info.version = settings.swagger_version.clone();
 
     let bind_addr = settings.bind_addr.clone();
     tracing::info!("Listening on {}", bind_addr);
