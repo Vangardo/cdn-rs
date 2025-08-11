@@ -8,6 +8,7 @@ use crate::{
     imaging::{convert_and_save_jpg, get_resize_image_bytes},
     models::image::{PushImageWrapper, ResponsePushImage},
 };
+use reqwest::Client;
 
 #[utoipa::path(
     post,
@@ -55,6 +56,7 @@ pub async fn get_resize_image_root(
     path: web::Path<(String, String)>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
+    client: web::Data<Client>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, param) = path.into_inner();
     let mut parts = param.split('x');
@@ -72,6 +74,7 @@ pub async fn get_resize_image_root(
         Some("ffffff"),
         &db,
         &settings,
+        &client,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
@@ -88,6 +91,7 @@ pub async fn get_original_image_root(
     path: web::Path<String>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
+    client: web::Data<Client>,
 ) -> Result<HttpResponse, ApiError> {
     let guid = path.into_inner();
     let (bytes, ct) = get_resize_image_bytes(
@@ -98,6 +102,7 @@ pub async fn get_original_image_root(
         Some("ffffff"),
         &db,
         &settings,
+        &client,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
@@ -125,6 +130,7 @@ pub async fn get_image_with_format(
     q: web::Query<FormatQuery>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
+    client: web::Data<Client>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, mut format) = path.into_inner();
     let valid = ["JPEG", "PNG", "GIF", "TIFF", "WebP"];
@@ -139,6 +145,7 @@ pub async fn get_image_with_format(
         q.odn_bg.as_deref(),
         &db,
         &settings,
+        &client,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
@@ -155,6 +162,7 @@ pub async fn get_resize_image_prefixed(
     path: web::Path<(String, String)>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
+    client: web::Data<Client>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, param) = path.into_inner();
     let mut parts = param.split('x');
@@ -170,6 +178,7 @@ pub async fn get_resize_image_prefixed(
         Some("ffffff"),
         &db,
         &settings,
+        &client,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
@@ -186,6 +195,7 @@ pub async fn get_original_image_prefixed(
     path: web::Path<String>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
+    client: web::Data<Client>,
 ) -> Result<HttpResponse, ApiError> {
     let guid = path.into_inner();
     let (bytes, ct) = get_resize_image_bytes(
@@ -196,6 +206,7 @@ pub async fn get_original_image_prefixed(
         Some("ffffff"),
         &db,
         &settings,
+        &client,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
