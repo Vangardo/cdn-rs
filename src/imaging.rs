@@ -1,4 +1,4 @@
-use crate::{config::Settings, db::Db, errors::ApiError, util};
+use crate::{cache::Cache, config::Settings, db::Db, errors::ApiError, util};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use fast_image_resize::{self as fir, images::Image as FirImage};
@@ -223,6 +223,7 @@ pub async fn get_resize_image_bytes(
     db: &Db,
     settings: &Settings,
     client: &Client,
+    cache: &Cache,
 ) -> Result<(Vec<u8>, String), ApiError> {
     let started = Instant::now();
 
@@ -255,6 +256,27 @@ pub async fn get_resize_image_bytes(
     let bg_hex_owned = bg_hex.map(|s| s.to_string());
     let fmt_owned = format.map(|f| f.to_ascii_uppercase());
 
+    let cache_key = format!(
+        "img:{}:{}:{}:{}:{}",
+        guid_or_slug,
+        width.unwrap_or(0),
+        height.unwrap_or(0),
+        fmt_owned.as_deref().unwrap_or("JPEG"),
+        bg_hex_owned.as_deref().unwrap_or("ffffff"),
+    );
+
+    if let Ok(Some(bytes)) = cache.get(&cache_key).await {
+        let ct = match fmt_owned.as_deref() {
+            Some("PNG") => "image/png",
+            Some("GIF") => "image/gif",
+            Some("TIFF") => "image/tiff",
+            Some("WEBP") => "image/webp",
+            _ => "image/jpeg",
+        }
+        .to_string();
+        return Ok((bytes, ct));
+    }
+
     if width.is_none()
         && height.is_none()
         && fmt_owned
@@ -266,6 +288,9 @@ pub async fn get_resize_image_bytes(
             .unwrap_or(true)
     {
         if let Some(buf) = downloaded {
+            let _ = cache
+                .insert_with_ttl(&cache_key, &buf, 900, 500)
+                .await;
             return Ok((buf, "image/jpeg".to_string()));
         }
         let path = if Path::new(&input_path).exists() {
@@ -276,6 +301,9 @@ pub async fn get_resize_image_bytes(
         let buf = tokio_fs::read(&path)
             .await
             .map_err(|e| ApiError::Io(e.to_string()))?;
+        let _ = cache
+            .insert_with_ttl(&cache_key, &buf, 900, 500)
+            .await;
         return Ok((buf, "image/jpeg".to_string()));
     }
 
@@ -411,6 +439,10 @@ pub async fn get_resize_image_bytes(
     .await
     .map_err(|_| ApiError::Internal)??;
     drop(permit);
+
+    let _ = cache
+        .insert_with_ttl(&cache_key, &buf, 900, 500)
+        .await;
 
     tracing::info!(
         "get_resize_image_bytes took {}ms",
