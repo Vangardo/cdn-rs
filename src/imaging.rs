@@ -48,6 +48,8 @@ async fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     let mut f = tokio_fs::File::create(&tmp).await?;
     f.write_all(bytes).await?;
     f.flush().await?;
+    f.sync_all().await?;
+    drop(f);
     tokio_fs::rename(&tmp, path).await?;
     Ok(())
 }
@@ -179,6 +181,9 @@ pub async fn save_img_from_url(
         }
     }
     let buf = bytes.to_vec();
+    // verify that downloaded bytes represent a valid image before saving
+    image::load_from_memory(&buf)
+        .map_err(|e| ApiError::Img(format!("invalid image data: {}", e)))?;
     atomic_write(output_path, &buf)
         .await
         .map_err(|e| ApiError::Io(e.to_string()))?;
