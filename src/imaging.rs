@@ -21,18 +21,6 @@ static BLOCKING_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(num_cpus::get
 
 const JPEG_Q: f32 = 75.0;
 
-trait DecompressExt {
-    fn set_scale(&mut self, num: u32, denom: u32);
-}
-
-impl<R> DecompressExt for Decompress<R> {
-    fn set_scale(&mut self, num: u32, denom: u32) {
-        let denom = denom.max(1);
-        let numer = ((num * 8) / denom).clamp(1, 16) as u8;
-        self.scale(numer);
-    }
-}
-
 async fn ensure_dir_async(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         tokio_fs::create_dir_all(parent).await?;
@@ -88,28 +76,34 @@ fn target_and_foreground(
         .min(1.0);
     let fg_w = ((orig_w as f32 * r).round() as u32).max(1);
     let fg_h = ((orig_h as f32 * r).round() as u32).max(1);
-    (tw, th, fg_w, fg_h, r < 1.0)
-}
 
-fn choose_dct_denom(sw: u32, sh: u32, fg_w: u32, fg_h: u32) -> u8 {
-    // хотим после DCT-скейла иметь >= fg_w×fg_h (чтобы дальше ТОЛЬКО даунскейл)
-    for &den in &[8u8, 4, 2, 1] {
-        if sw / den as u32 >= fg_w && sh / den as u32 >= fg_h {
-            return den;
-        }
+    // если задана только одна сторона, то конечный холст совпадает с изображением
+    if req_w.is_some() && req_h.is_none() {
+        th = fg_h;
+    } else if req_h.is_some() && req_w.is_none() {
+        tw = fg_w;
     }
-    1
+
+    (tw, th, fg_w, fg_h, r < 1.0)
 }
 
 fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiError> {
     if rgb.width() == dst_w && rgb.height() == dst_h {
         return Ok(rgb);
     }
-    let filter = if dst_w.max(dst_h) >= 512 {
-        fir::FilterType::CatmullRom
+    if dst_w > rgb.width() || dst_h > rgb.height() {
+        return Err(ApiError::Img("upscale not supported".into()));
+    }
+
+    let max_dim = dst_w.max(dst_h);
+    let filter = if max_dim >= 512 {
+        fir::FilterType::Lanczos3
+    } else if max_dim >= 256 {
+        fir::FilterType::Mitchell
     } else {
-        fir::FilterType::Box
+        fir::FilterType::Hamming
     };
+
     let src = FirImage::from_vec_u8(
         rgb.width(),
         rgb.height(),
@@ -420,8 +414,6 @@ pub async fn get_resize_image_bytes(
                     early_ct = Some("image/jpeg".to_string());
                     (RgbImage::new(0, 0), 0, 0)
                 } else {
-                    let denom = choose_dct_denom(sw, sh, fg_w, fg_h);
-                    d.set_scale(1, denom as u32);
                     let mut started = d.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
                     let (dw, dh) = (started.width() as u32, started.height() as u32);
                     let mut buf = vec![0u8; (dw * dh * 3) as usize];
