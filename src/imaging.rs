@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use fast_image_resize::{self as fir, images::Image as FirImage};
 use image::imageops;
 use image::{self, DynamicImage, ImageFormat, RgbImage};
-use mozjpeg::{ColorSpace, Compress, Decompress};
+// mozjpeg больше не используется - заменили на image crate
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use std::{fs, io::Cursor, path::Path, sync::Arc, time::Instant};
@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 static BLOCKING_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(num_cpus::get() * 2)); // Увеличиваем параллельность
 
-const JPEG_Q: f32 = 75.0;
+const JPEG_Q: f32 = 85.0; // Увеличиваем качество для лучшего результата
 
 async fn ensure_dir_async(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
@@ -63,6 +63,11 @@ fn target_and_foreground(
     req_h: Option<u32>,
     max_side: u32,
 ) -> (u32, u32, u32, u32, bool) {
+    // Проверяем исходные размеры
+    if orig_w == 0 || orig_h == 0 {
+        return (1, 1, 1, 1, false);
+    }
+    
     // рамка (target)
     let mut tw = req_w.unwrap_or(orig_w).min(max_side);
     let mut th = req_h.unwrap_or(orig_h).min(max_side);
@@ -70,6 +75,7 @@ fn target_and_foreground(
         tw = orig_w.min(max_side);
         th = orig_h.min(max_side);
     }
+    
     // вписывание + баним апскейл
     let r = (tw as f32 / orig_w as f32)
         .min(th as f32 / orig_h as f32)
@@ -83,6 +89,12 @@ fn target_and_foreground(
     } else if req_h.is_some() && req_w.is_none() {
         tw = fg_w;
     }
+    
+    // Финальная проверка - все размеры должны быть > 0
+    let tw = tw.max(1);
+    let th = th.max(1);
+    let fg_w = fg_w.max(1);
+    let fg_h = fg_h.max(1);
 
     (tw, th, fg_w, fg_h, r < 1.0)
 }
@@ -91,6 +103,17 @@ fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiErro
     if rgb.width() == dst_w && rgb.height() == dst_h {
         return Ok(rgb);
     }
+    
+    // Проверяем на нулевые размеры
+    if dst_w == 0 || dst_h == 0 {
+        return Err(ApiError::Img("invalid destination dimensions: zero size".into()));
+    }
+    
+    // Проверяем, что исходное изображение не пустое
+    if rgb.width() == 0 || rgb.height() == 0 {
+        return Err(ApiError::Img("source image has zero dimensions".into()));
+    }
+    
     if dst_w > rgb.width() || dst_h > rgb.height() {
         return Err(ApiError::Img("upscale not supported".into()));
     }
@@ -104,10 +127,26 @@ fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiErro
         fir::FilterType::Hamming
     };
 
+    // Сохраняем размеры до вызова into_raw()
+    let width = rgb.width();
+    let height = rgb.height();
+    
+    let rgb_data = rgb.into_raw();
+    
+    // Проверяем, что данные RGB корректны
+    if rgb_data.len() != (width * height * 3) as usize {
+        return Err(ApiError::Img("RGB data length mismatch".into()));
+    }
+    
+    // Проверяем, что нет некорректных значений RGB
+    if rgb_data.iter().any(|&b| b > 255) {
+        return Err(ApiError::Img("Invalid RGB values detected".into()));
+    }
+    
     let src = FirImage::from_vec_u8(
-        rgb.width(),
-        rgb.height(),
-        rgb.into_raw(),
+        width,
+        height,
+        rgb_data,
         fir::PixelType::U8x3,
     )
     .map_err(|e| ApiError::Img(e.to_string()))?;
@@ -117,8 +156,28 @@ fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiErro
     resizer
         .resize(&src, &mut dst, &opts)
         .map_err(|e| ApiError::Img(e.to_string()))?;
-    RgbImage::from_raw(dst_w, dst_h, dst.into_vec())
-        .ok_or_else(|| ApiError::Img("resize failed".into()))
+    
+    let result_data = dst.into_vec();
+    
+    // Проверяем, что результат ресайза корректный
+    if result_data.len() != (dst_w * dst_h * 3) as usize {
+        return Err(ApiError::Img("resize result data length mismatch".into()));
+    }
+    
+    let result = RgbImage::from_raw(dst_w, dst_h, result_data)
+        .ok_or_else(|| ApiError::Img("resize failed".into()))?;
+    
+    // Дополнительная проверка результата
+    if result.width() != dst_w || result.height() != dst_h {
+        return Err(ApiError::Img("resize result has wrong dimensions".into()));
+    }
+    
+    // Проверяем, что результат не пустой
+    if result.width() == 0 || result.height() == 0 {
+        return Err(ApiError::Img("resize result has zero dimensions".into()));
+    }
+    
+    Ok(result)
 }
 
 fn normalize_onlihub_extensions(mut url: String) -> String {
@@ -207,32 +266,20 @@ pub async fn convert_and_save_jpg(
 
     let permit = BLOCKING_SEM.acquire().await.unwrap();
     task::spawn_blocking(move || -> Result<(), ApiError> {
-        let rgb = match Decompress::new_mem(&decoded) {
-            Ok(dec) => {
-                let mut dec = dec.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
-                let w = dec.width() as u32;
-                let h = dec.height() as u32;
-                let mut data = vec![0u8; (w * h * 3) as usize];
-                dec.read_scanlines_into(&mut data)
-                    .map_err(|e| ApiError::Img(e.to_string()))?;
-                RgbImage::from_raw(w, h, data)
-                    .ok_or_else(|| ApiError::Img("decode failed".into()))?
-            }
-            Err(_) => image::load_from_memory(&decoded)
-                .map_err(|e| ApiError::Img(e.to_string()))?
-                .to_rgb8(),
-        };
-        let mut comp = Compress::new(ColorSpace::JCS_RGB);
-        comp.set_size(rgb.width() as usize, rgb.height() as usize);
-        comp.set_quality(JPEG_Q);
-        comp.set_optimize_scans(false);
-        comp.set_optimize_coding(false);
-        let mut comp = comp
-            .start_compress(Vec::new())
-            .map_err(|e| ApiError::Img(e.to_string()))?;
-        comp.write_scanlines(&rgb)
-            .map_err(|e| ApiError::Img(e.to_string()))?;
-        let buf = comp.finish().map_err(|e| ApiError::Img(e.to_string()))?;
+        // Используем только image crate - убираем проблемное mozjpeg
+        let rgb = image::load_from_memory(&decoded)
+            .map_err(|e| ApiError::Img(e.to_string()))?
+            .to_rgb8();
+        
+        // Используем image crate для JPEG-кодирования
+        let mut buf = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+            &mut buf, 
+            JPEG_Q as u8
+        );
+        encoder.encode(&rgb, rgb.width(), rgb.height(), image::ColorType::Rgb8.into())
+            .map_err(|e| ApiError::Img(format!("JPEG encoding failed: {}", e)))?;
+        
         fs::write(&out_path, &buf).map_err(|e| ApiError::Io(e.to_string()))?;
         Ok(())
     })
@@ -391,12 +438,26 @@ pub async fn get_resize_image_bytes(
                 fs::read(&no_image_path_clone).map_err(|e| ApiError::Io(e.to_string()))?
             };
 
-            let mut early_ct: Option<String> = None;
-            let (mut rgb, tw, th) = if let Ok(mut d) = Decompress::new_mem(&data) {
-                let (sw, sh) = (d.width() as u32, d.height() as u32);
+            // early_ct больше не нужен - убрали проблемную логику
+            let (mut rgb, tw, th) = {
+                // Используем только image crate для декодирования - убираем проблемное DCT-декодирование mozjpeg
+                let img = if data.is_empty() {
+                    DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
+                } else {
+                    image::load_from_memory(&data).map_err(|e| ApiError::Img(e.to_string()))?
+                };
+                
+                let (sw, sh) = (img.width(), img.height());
+                
+                // Проверяем, что изображение не пустое
+                if sw == 0 || sh == 0 {
+                    return Err(ApiError::Img("source image has zero dimensions".into()));
+                }
+                
                 let (tw, th, fg_w, fg_h, need_resize) =
                     target_and_foreground(sw, sh, width, height, max_side);
-
+                
+                // Проверяем, нужен ли ресайз вообще
                 if (width.is_some() || height.is_some())
                     && fg_w == sw
                     && fg_h == sh
@@ -410,58 +471,54 @@ pub async fn get_resize_image_bytes(
                         .map(|s| s.eq_ignore_ascii_case("ffffff"))
                         .unwrap_or(true)
                 {
-                    drop(d);
-                    early_ct = Some("image/jpeg".to_string());
-                    (RgbImage::new(0, 0), 0, 0)
-                } else {
-                    let mut started = d.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
-                    let (dw, dh) = (started.width() as u32, started.height() as u32);
-                    let mut buf = vec![0u8; (dw * dh * 3) as usize];
-                    started
-                        .read_scanlines_into(&mut buf)
-                        .map_err(|e| ApiError::Img(e.to_string()))?;
-                    let base = RgbImage::from_raw(dw, dh, buf)
-                        .ok_or_else(|| ApiError::Img("bad rgb".into()))?;
-                    let rgb = if need_resize {
-                        fir_resize(base, fg_w, fg_h)?
-                    } else {
-                        base
-                    };
-                    (rgb, tw, th)
+                    // Если ресайз не нужен, возвращаем оригинал
+                    return Ok((data, "image/jpeg".to_string()));
                 }
-            } else {
-                let img = if data.is_empty() {
-                    DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
-                } else {
-                    image::load_from_memory(&data).map_err(|e| ApiError::Img(e.to_string()))?
-                };
-                let (sw, sh) = (img.width(), img.height());
-                let (tw, th, fg_w, fg_h, need_resize) =
-                    target_and_foreground(sw, sh, width, height, max_side);
+                
                 let base = img.to_rgb8();
                 let rgb = if need_resize {
                     fir_resize(base, fg_w, fg_h)?
                 } else {
                     base
                 };
+                
                 (rgb, tw, th)
             };
 
-            if let Some(ct) = early_ct {
-                return Ok((data, ct));
-            }
+            // early_ct больше не используется
 
             let bg_is_default = bg_hex_owned
                 .as_deref()
                 .unwrap_or("ffffff")
                 .eq_ignore_ascii_case("ffffff");
             if rgb.width() != tw || rgb.height() != th || !bg_is_default {
+                // Проверяем, что размеры корректны
+                if tw == 0 || th == 0 {
+                    return Err(ApiError::Img("invalid target dimensions for background".into()));
+                }
+                
                 let (r, g, b) = hex_to_rgb(bg_hex_owned.as_deref().unwrap_or("ffffff"));
                 let mut bg = RgbImage::from_pixel(tw, th, image::Rgb([r, g, b]));
-                let x = ((tw - rgb.width()) / 2) as i64;
-                let y = ((th - rgb.height()) / 2) as i64;
-                imageops::replace(&mut bg, &rgb, x, y);
-                rgb = bg;
+                
+                // Безопасный расчет позиции для центрирования
+                let x = if rgb.width() <= tw { 
+                    ((tw - rgb.width()) / 2) as i64 
+                } else { 
+                    0 
+                };
+                let y = if rgb.height() <= th { 
+                    ((th - rgb.height()) / 2) as i64 
+                } else { 
+                    0 
+                };
+                
+                // Проверяем, что позиция не отрицательная
+                if x >= 0 && y >= 0 {
+                    imageops::replace(&mut bg, &rgb, x, y);
+                    rgb = bg;
+                } else {
+                    return Err(ApiError::Img("failed to position image on background".into()));
+                }
             }
 
             let fmt = match fmt_owned.as_deref() {
@@ -475,17 +532,14 @@ pub async fn get_resize_image_bytes(
             let mut buf = Vec::new();
             match fmt {
                 ImageFormat::Jpeg => {
-                    let mut comp = Compress::new(ColorSpace::JCS_RGB);
-                    comp.set_size(tw as usize, th as usize);
-                    comp.set_quality(JPEG_Q);
-                    comp.set_optimize_scans(false);
-                    comp.set_optimize_coding(false);
-                    let mut comp = comp
-                        .start_compress(Vec::new())
-                        .map_err(|e| ApiError::Img(e.to_string()))?;
-                    comp.write_scanlines(&rgb)
-                        .map_err(|e| ApiError::Img(e.to_string()))?;
-                    buf = comp.finish().map_err(|e| ApiError::Img(e.to_string()))?;
+                    // Используем image crate вместо проблемного mozjpeg Compress
+                    let mut cur = Cursor::new(&mut buf);
+                    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                        &mut cur, 
+                        JPEG_Q as u8
+                    );
+                    encoder.encode(&rgb, rgb.width(), rgb.height(), image::ColorType::Rgb8.into())
+                        .map_err(|e| ApiError::Img(format!("JPEG encoding failed: {}", e)))?;
                 }
                 other => {
                     let mut cur = Cursor::new(&mut buf);
@@ -503,6 +557,11 @@ pub async fn get_resize_image_bytes(
                 _ => "image/jpeg",
             }
             .to_string();
+
+            // Финальная проверка - буфер не должен быть пустым
+            if buf.is_empty() {
+                return Err(ApiError::Img("generated image buffer is empty".into()));
+            }
 
             Ok((buf, ct))
         })
