@@ -23,6 +23,8 @@ rand = "0.8"
 regex = "1"
 redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 
+dashmap = "5"
+
 # БД
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros"] }
 
