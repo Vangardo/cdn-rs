@@ -1,18 +1,23 @@
 use crate::{cache::Cache, config::Settings, db::Db, errors::ApiError, util};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use dashmap::DashMap;
 use fast_image_resize::{self as fir, images::Image as FirImage};
 use image::imageops;
 use image::{self, DynamicImage, ImageFormat, RgbImage};
 use mozjpeg::{ColorSpace, Compress, Decompress};
 use once_cell::sync::Lazy;
 use reqwest::Client;
-use std::{fs, io::Cursor, path::Path, time::Instant};
-use tokio::{fs as tokio_fs, sync::Semaphore, task};
+use std::{fs, io::Cursor, path::Path, sync::Arc, time::Instant};
+use tokio::{
+    fs as tokio_fs,
+    io::AsyncWriteExt,
+    sync::{Mutex, Semaphore},
+    task,
+};
 use uuid::Uuid;
 
-static BLOCKING_SEM: Lazy<Semaphore> =
-    Lazy::new(|| Semaphore::new(num_cpus::get() * 2)); // Увеличиваем параллельность
+static BLOCKING_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(num_cpus::get() * 2)); // Увеличиваем параллельность
 
 const JPEG_Q: f32 = 75.0;
 
@@ -33,6 +38,32 @@ async fn ensure_dir_async(path: &str) -> std::io::Result<()> {
         tokio_fs::create_dir_all(parent).await?;
     }
     Ok(())
+}
+
+async fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        tokio_fs::create_dir_all(parent).await?;
+    }
+    let tmp = format!("{}.part", path);
+    let mut f = tokio_fs::File::create(&tmp).await?;
+    f.write_all(bytes).await?;
+    f.flush().await?;
+    tokio_fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
+static VARIANT_LOCKS: Lazy<DashMap<String, Arc<Mutex<()>>>> = Lazy::new(DashMap::new);
+
+async fn with_variant_lock<T, F>(key: &str, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let lock = VARIANT_LOCKS
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _g = lock.lock().await;
+    fut.await
 }
 
 fn target_and_foreground(
@@ -114,8 +145,6 @@ pub async fn save_img_from_url(
     if url.is_empty() {
         return Err(ApiError::BadRequest("empty url".into()));
     }
-    // Директории создаются асинхронно в spawn блоке
-
     let norm_url = normalize_onlihub_extensions(url.to_string());
 
     let resp = client
@@ -129,19 +158,30 @@ pub async fn save_img_from_url(
             resp.status()
         )));
     }
+    if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
+        let ok = ct
+            .to_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .starts_with("image/");
+        if !ok {
+            return Err(ApiError::Img(format!("bad content-type: {ct:?}")));
+        }
+    }
+    let content_length = resp.content_length();
     let bytes = resp
         .bytes()
         .await
         .map_err(|e| ApiError::Io(e.to_string()))?;
-    let buf = bytes.to_vec();
-    let path = output_path.to_string();
-    let buf_clone = buf.clone();
-    tokio::spawn(async move {
-        if let Some(parent) = Path::new(&path).parent() {
-            let _ = tokio_fs::create_dir_all(parent).await;
+    if let Some(cl) = content_length {
+        if bytes.len() as u64 != cl {
+            return Err(ApiError::Img("truncated download".into()));
         }
-        let _ = tokio_fs::write(path, &buf_clone).await;
-    });
+    }
+    let buf = bytes.to_vec();
+    atomic_write(output_path, &buf)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
     Ok(buf)
 }
 
@@ -157,7 +197,9 @@ pub async fn convert_and_save_jpg(
 
     // Декод и запись — в blocking, чтобы не забивать runtime
     let out_path = format!("{}{}.jpg", settings.media_base_dir, guid);
-    ensure_dir_async(&out_path).await.map_err(|e| ApiError::Io(e.to_string()))?;
+    ensure_dir_async(&out_path)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
 
     let base64_img = base64_img.trim();
     let decoded = BASE64
@@ -285,207 +327,198 @@ pub async fn get_resize_image_bytes(
         bg_hex_owned.as_deref(),
     );
 
-    // Прямое чтение с диска - без лишних проверок
     if let Ok(bytes) = tokio_fs::read(&disk_path).await {
         return Ok((bytes, ct_guess));
     }
 
-    // 2. Если нет на диске - идем в БД
-    let input_path = if guid.is_nil() {
-        settings.no_image_full_path()
-    } else {
-        format!("{}{}.jpg", settings.media_base_dir, guid)
-    };
-
-    // Асинхронная проверка существования файла
-    let file_exists = tokio_fs::try_exists(&input_path).await.unwrap_or(false);
-    
-    let mut downloaded: Option<Vec<u8>> = None;
-    if !file_exists && !guid.is_nil() {
-        // Параллельная загрузка и обработка
-        if let Some(link) = db.get_original_link_by_guid(guid).await? {
-            downloaded = save_img_from_url(client, &link, &input_path).await.ok();
+    let result = with_variant_lock(&disk_path, async {
+        if let Ok(bytes) = tokio_fs::read(&disk_path).await {
+            return Ok((bytes, ct_guess.clone()));
         }
-    }
 
-    let no_image_path = settings.no_image_full_path();
-    let max_side = settings.max_image_side;
-
-        // Оптимизация: если оригинал без изменений - сразу возвращаем
-    if width.is_none()
-        && height.is_none()
-        && fmt_owned
-            .as_deref()
-            .map_or(true, |f| f.eq_ignore_ascii_case("JPEG"))
-        && bg_hex_owned
-            .as_deref()
-            .map(|s| s.eq_ignore_ascii_case("ffffff"))
-            .unwrap_or(true)
-    {
-        let buf = if let Some(buf) = downloaded {
-            buf
-        } else if file_exists {
-            tokio_fs::read(&input_path).await.map_err(|e| ApiError::Io(e.to_string()))?
+        let input_path = if guid.is_nil() {
+            settings.no_image_full_path()
         } else {
-            tokio_fs::read(&no_image_path).await.map_err(|e| ApiError::Io(e.to_string()))?
+            format!("{}{}.jpg", settings.media_base_dir, guid)
         };
 
-        // Асинхронная запись на диск без временных файлов
-        let disk_path_clone = disk_path.clone();
-        let buf_clone = buf.clone();
-        tokio::spawn(async move {
-            if let Some(parent) = Path::new(&disk_path_clone).parent() {
-                let _ = tokio_fs::create_dir_all(parent).await;
+        let file_exists = tokio_fs::try_exists(&input_path).await.unwrap_or(false);
+        let mut downloaded: Option<Vec<u8>> = None;
+        if !file_exists && !guid.is_nil() {
+            if let Some(link) = db.get_original_link_by_guid(guid).await? {
+                downloaded = save_img_from_url(client, &link, &input_path).await.ok();
             }
-            let _ = tokio_fs::write(&disk_path_clone, &buf_clone).await;
-        });
+        }
 
-        return Ok((buf, ct_guess));
-    }
+        let no_image_path = settings.no_image_full_path();
+        let max_side = settings.max_image_side;
 
-    let permit = BLOCKING_SEM.acquire().await.unwrap();
-    let input_path_clone = input_path.clone();
-    let no_image_path_clone = no_image_path.clone();
-    let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
-        let data = if let Some(b) = downloaded {
-            b
-        } else if Path::new(&input_path_clone).exists() {
-            fs::read(&input_path_clone).map_err(|e| ApiError::Io(e.to_string()))?
-        } else {
-            fs::read(&no_image_path_clone).map_err(|e| ApiError::Io(e.to_string()))?
-        };
-
-        // Оптимизация: убираем лишнее клонирование
-        let mut early_ct: Option<String> = None;
-        let (mut rgb, tw, th) = if let Ok(mut d) = Decompress::new_mem(&data) {
-            let (sw, sh) = (d.width() as u32, d.height() as u32);
-            let (tw, th, fg_w, fg_h, need_resize) =
-                target_and_foreground(sw, sh, width, height, max_side);
-
-            if (width.is_some() || height.is_some())
-                && fg_w == sw
-                && fg_h == sh
-                && tw == sw
-                && th == sh
-                && fmt_owned
-                    .as_deref()
-                    .map_or(true, |f| f.eq_ignore_ascii_case("JPEG"))
-                && bg_hex_owned
-                    .as_deref()
-                    .map(|s| s.eq_ignore_ascii_case("ffffff"))
-                    .unwrap_or(true)
-            {
-                drop(d);
-                early_ct = Some("image/jpeg".to_string());
-                (RgbImage::new(0, 0), 0, 0)
+        if width.is_none()
+            && height.is_none()
+            && fmt_owned
+                .as_deref()
+                .map_or(true, |f| f.eq_ignore_ascii_case("JPEG"))
+            && bg_hex_owned
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("ffffff"))
+                .unwrap_or(true)
+        {
+            let buf = if let Some(buf) = downloaded {
+                buf
+            } else if file_exists {
+                tokio_fs::read(&input_path)
+                    .await
+                    .map_err(|e| ApiError::Io(e.to_string()))?
             } else {
-                let denom = choose_dct_denom(sw, sh, fg_w, fg_h);
-                d.set_scale(1, denom as u32);
-                let mut started = d.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
-                let (dw, dh) = (started.width() as u32, started.height() as u32);
-                let mut buf = vec![0u8; (dw * dh * 3) as usize];
-                started
-                    .read_scanlines_into(&mut buf)
-                    .map_err(|e| ApiError::Img(e.to_string()))?;
-                let base = RgbImage::from_raw(dw, dh, buf)
-                    .ok_or_else(|| ApiError::Img("bad rgb".into()))?;
+                tokio_fs::read(&no_image_path)
+                    .await
+                    .map_err(|e| ApiError::Io(e.to_string()))?
+            };
+            atomic_write(&disk_path, &buf)
+                .await
+                .map_err(|e| ApiError::Io(e.to_string()))?;
+            return Ok((buf, ct_guess.clone()));
+        }
+
+        let permit = BLOCKING_SEM.acquire().await.unwrap();
+        let input_path_clone = input_path.clone();
+        let no_image_path_clone = no_image_path.clone();
+        let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
+            let data = if let Some(b) = downloaded {
+                b
+            } else if Path::new(&input_path_clone).exists() {
+                fs::read(&input_path_clone).map_err(|e| ApiError::Io(e.to_string()))?
+            } else {
+                fs::read(&no_image_path_clone).map_err(|e| ApiError::Io(e.to_string()))?
+            };
+
+            let mut early_ct: Option<String> = None;
+            let (mut rgb, tw, th) = if let Ok(mut d) = Decompress::new_mem(&data) {
+                let (sw, sh) = (d.width() as u32, d.height() as u32);
+                let (tw, th, fg_w, fg_h, need_resize) =
+                    target_and_foreground(sw, sh, width, height, max_side);
+
+                if (width.is_some() || height.is_some())
+                    && fg_w == sw
+                    && fg_h == sh
+                    && tw == sw
+                    && th == sh
+                    && fmt_owned
+                        .as_deref()
+                        .map_or(true, |f| f.eq_ignore_ascii_case("JPEG"))
+                    && bg_hex_owned
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case("ffffff"))
+                        .unwrap_or(true)
+                {
+                    drop(d);
+                    early_ct = Some("image/jpeg".to_string());
+                    (RgbImage::new(0, 0), 0, 0)
+                } else {
+                    let denom = choose_dct_denom(sw, sh, fg_w, fg_h);
+                    d.set_scale(1, denom as u32);
+                    let mut started = d.rgb().map_err(|e| ApiError::Img(e.to_string()))?;
+                    let (dw, dh) = (started.width() as u32, started.height() as u32);
+                    let mut buf = vec![0u8; (dw * dh * 3) as usize];
+                    started
+                        .read_scanlines_into(&mut buf)
+                        .map_err(|e| ApiError::Img(e.to_string()))?;
+                    let base = RgbImage::from_raw(dw, dh, buf)
+                        .ok_or_else(|| ApiError::Img("bad rgb".into()))?;
+                    let rgb = if need_resize {
+                        fir_resize(base, fg_w, fg_h)?
+                    } else {
+                        base
+                    };
+                    (rgb, tw, th)
+                }
+            } else {
+                let img = if data.is_empty() {
+                    DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
+                } else {
+                    image::load_from_memory(&data).map_err(|e| ApiError::Img(e.to_string()))?
+                };
+                let (sw, sh) = (img.width(), img.height());
+                let (tw, th, fg_w, fg_h, need_resize) =
+                    target_and_foreground(sw, sh, width, height, max_side);
+                let base = img.to_rgb8();
                 let rgb = if need_resize {
                     fir_resize(base, fg_w, fg_h)?
                 } else {
                     base
                 };
                 (rgb, tw, th)
-            }
-        } else {
-            let img = if data.is_empty() {
-                DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
-            } else {
-                image::load_from_memory(&data).map_err(|e| ApiError::Img(e.to_string()))?
             };
-            let (sw, sh) = (img.width(), img.height());
-            let (tw, th, fg_w, fg_h, need_resize) =
-                target_and_foreground(sw, sh, width, height, max_side);
-            let base = img.to_rgb8();
-            let rgb = if need_resize {
-                fir_resize(base, fg_w, fg_h)?
-            } else {
-                base
+
+            if let Some(ct) = early_ct {
+                return Ok((data, ct));
+            }
+
+            let bg_is_default = bg_hex_owned
+                .as_deref()
+                .unwrap_or("ffffff")
+                .eq_ignore_ascii_case("ffffff");
+            if rgb.width() != tw || rgb.height() != th || !bg_is_default {
+                let (r, g, b) = hex_to_rgb(bg_hex_owned.as_deref().unwrap_or("ffffff"));
+                let mut bg = RgbImage::from_pixel(tw, th, image::Rgb([r, g, b]));
+                let x = ((tw - rgb.width()) / 2) as i64;
+                let y = ((th - rgb.height()) / 2) as i64;
+                imageops::replace(&mut bg, &rgb, x, y);
+                rgb = bg;
+            }
+
+            let fmt = match fmt_owned.as_deref() {
+                Some("PNG") => ImageFormat::Png,
+                Some("GIF") => ImageFormat::Gif,
+                Some("TIFF") => ImageFormat::Tiff,
+                Some("WEBP") => ImageFormat::WebP,
+                _ => ImageFormat::Jpeg,
             };
-            (rgb, tw, th)
-        };
 
-        if let Some(ct) = early_ct {
-            return Ok((data, ct));
-        }
-
-        let bg_is_default = bg_hex_owned
-            .as_deref()
-            .unwrap_or("ffffff")
-            .eq_ignore_ascii_case("ffffff");
-        if rgb.width() != tw || rgb.height() != th || !bg_is_default {
-            let (r, g, b) = hex_to_rgb(bg_hex_owned.as_deref().unwrap_or("ffffff"));
-            let mut bg = RgbImage::from_pixel(tw, th, image::Rgb([r, g, b]));
-            let x = ((tw - rgb.width()) / 2) as i64;
-            let y = ((th - rgb.height()) / 2) as i64;
-            imageops::replace(&mut bg, &rgb, x, y);
-            rgb = bg;
-        }
-
-        let fmt = match fmt_owned.as_deref() {
-            Some("PNG") => ImageFormat::Png,
-            Some("GIF") => ImageFormat::Gif,
-            Some("TIFF") => ImageFormat::Tiff,
-            Some("WEBP") => ImageFormat::WebP,
-            _ => ImageFormat::Jpeg,
-        };
-
-        let mut buf = Vec::new();
-        match fmt {
-            ImageFormat::Jpeg => {
-                let mut comp = Compress::new(ColorSpace::JCS_RGB);
-                comp.set_size(tw as usize, th as usize);
-                comp.set_quality(JPEG_Q);
-                comp.set_optimize_scans(false);
-                comp.set_optimize_coding(false);
-                let mut comp = comp
-                    .start_compress(Vec::new())
-                    .map_err(|e| ApiError::Img(e.to_string()))?;
-                comp.write_scanlines(&rgb)
-                    .map_err(|e| ApiError::Img(e.to_string()))?;
-                buf = comp.finish().map_err(|e| ApiError::Img(e.to_string()))?;
+            let mut buf = Vec::new();
+            match fmt {
+                ImageFormat::Jpeg => {
+                    let mut comp = Compress::new(ColorSpace::JCS_RGB);
+                    comp.set_size(tw as usize, th as usize);
+                    comp.set_quality(JPEG_Q);
+                    comp.set_optimize_scans(false);
+                    comp.set_optimize_coding(false);
+                    let mut comp = comp
+                        .start_compress(Vec::new())
+                        .map_err(|e| ApiError::Img(e.to_string()))?;
+                    comp.write_scanlines(&rgb)
+                        .map_err(|e| ApiError::Img(e.to_string()))?;
+                    buf = comp.finish().map_err(|e| ApiError::Img(e.to_string()))?;
+                }
+                other => {
+                    let mut cur = Cursor::new(&mut buf);
+                    DynamicImage::ImageRgb8(rgb)
+                        .write_to(&mut cur, other)
+                        .map_err(|e| ApiError::Img(e.to_string()))?;
+                }
             }
-            other => {
-                let mut cur = Cursor::new(&mut buf);
-                DynamicImage::ImageRgb8(rgb)
-                    .write_to(&mut cur, other)
-                    .map_err(|e| ApiError::Img(e.to_string()))?;
+
+            let ct = match fmt {
+                ImageFormat::Png => "image/png",
+                ImageFormat::Gif => "image/gif",
+                ImageFormat::Tiff => "image/tiff",
+                ImageFormat::WebP => "image/webp",
+                _ => "image/jpeg",
             }
-        }
+            .to_string();
 
-        let ct = match fmt {
-            ImageFormat::Png => "image/png",
-            ImageFormat::Gif => "image/gif",
-            ImageFormat::Tiff => "image/tiff",
-            ImageFormat::WebP => "image/webp",
-            _ => "image/jpeg",
-        }
-        .to_string();
+            Ok((buf, ct))
+        })
+        .await
+        .map_err(|_| ApiError::Internal)??;
+        drop(permit);
 
+        atomic_write(&disk_path, &buf)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
         Ok((buf, ct))
     })
-    .await
-    .map_err(|_| ApiError::Internal)??;
-    drop(permit);
-
-    // Асинхронная запись на диск без временных файлов
-    let disk_path_clone = disk_path.clone();
-    let buf_clone = buf.clone();
-    tokio::spawn(async move {
-        if let Some(parent) = Path::new(&disk_path_clone).parent() {
-            let _ = tokio_fs::create_dir_all(parent).await;
-        }
-        let _ = tokio_fs::write(&disk_path_clone, &buf_clone).await;
-    });
+    .await?;
 
     if !settings.production_mode {
         tracing::info!(
@@ -493,5 +526,5 @@ pub async fn get_resize_image_bytes(
             started.elapsed().as_millis()
         );
     }
-    Ok((buf, ct))
+    Ok(result)
 }
