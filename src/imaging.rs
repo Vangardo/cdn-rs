@@ -4,6 +4,8 @@ use base64::Engine;
 use fast_image_resize::{self as fir, images::Image as FirImage};
 use image::imageops;
 use image::{self, DynamicImage, ImageFormat, RgbImage};
+#[cfg(target_os = "linux")]
+use libc;
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use std::{
@@ -39,6 +41,18 @@ pub fn get_active_tasks_count() -> usize {
 }
 
 const JPEG_Q: f32 = 85.0;
+
+#[cfg(target_os = "linux")]
+fn release_memory() {
+    // SAFETY: libc::malloc_trim is unsafe as it interacts with the global allocator
+    // directly. We call it without any arguments to release free memory back to the OS.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn release_memory() {}
 
 async fn ensure_dir_async(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
@@ -169,6 +183,9 @@ async fn cleanup_old_locks() {
                 active_tasks,
                 *counter,
             );
+
+            // After releasing locks try to return unused memory back to the OS
+            release_memory();
         }
     }
 }
@@ -209,6 +226,9 @@ pub async fn force_cleanup_locks() {
             tracing::info!("Attempted to drop page cache");
         }
     }
+
+    // After force cleanup attempt to return unused memory to the OS
+    release_memory();
 }
 
 // Функция для получения статистики блокировок
@@ -242,6 +262,9 @@ where
     let guard = lock.lock().await;
     let result = fut.await;
     drop(guard);
+    // Drop our clone before checking the reference count so that unused
+    // entries can be removed immediately.
+    drop(lock);
 
     {
         let mut locks = VARIANT_LOCKS.lock().await;
@@ -757,6 +780,7 @@ pub async fn get_resize_image_bytes(
             };
 
             let (mut rgb, tw, th) = {
+                let mut data = data; // allow dropping early
                 let img = if data.is_empty() {
                     DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
                 } else {
@@ -790,6 +814,10 @@ pub async fn get_resize_image_bytes(
                     // Если ресайз не нужен, возвращаем оригинал
                     return Ok((data, "image/jpeg".to_string()));
                 }
+
+                // Оригинальные данные больше не нужны
+                data.clear();
+                data.shrink_to_fit();
 
                 let base = img.to_rgb8();
                 let rgb = if need_resize {
@@ -894,6 +922,8 @@ pub async fn get_resize_image_bytes(
             .map_err(|e| ApiError::Io(e.to_string()))?;
         let mut buf = buf;
         buf.shrink_to_fit();
+        // Try to release the memory held by intermediate buffers
+        release_memory();
         Ok((buf, ct))
     })
     .await?;
