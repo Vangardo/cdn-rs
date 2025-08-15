@@ -459,7 +459,11 @@ pub async fn save_img_from_url(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = Vec::with_capacity(content_length.unwrap_or(0) as usize);
+    let cap = content_length
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0)
+        .min(MAX_IMAGE_SIZE);
+    let mut buf = Vec::with_capacity(cap);
     if let Some(parent) = Path::new(output_path).parent() {
         tokio_fs::create_dir_all(parent)
             .await
