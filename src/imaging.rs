@@ -52,8 +52,11 @@ where
         .entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
-    let _g = lock.lock().await;
-    fut.await
+    let guard = lock.lock().await;
+    let result = fut.await;
+    drop(guard);
+    VARIANT_LOCKS.remove(key);
+    result
 }
 
 fn target_and_foreground(
