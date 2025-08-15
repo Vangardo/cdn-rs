@@ -7,14 +7,18 @@ use crate::{
     config::Settings,
     db::Db,
     errors::ApiError,
-    imaging::{convert_and_save_jpg, get_resize_image_bytes, variant_disk_path, get_locks_stats, force_cleanup_locks},
+    imaging::{
+        convert_and_save_jpg, force_cleanup_locks, get_locks_stats, get_resize_image_bytes,
+        variant_disk_path,
+    },
     models::image::{PushImageWrapper, ResponsePushImage},
     util,
 };
 use bytes::Bytes;
 use reqwest::Client;
 use std::path::Path;
-use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::mpsc};
+use std::sync::Arc;
+use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::Mutex};
 
 #[utoipa::path(
     post,
@@ -102,47 +106,45 @@ async fn stream_original(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("image/jpeg")
         .to_string();
-    let (tx, mut rx) = mpsc::channel::<Bytes>(16);
-    let file = tokio_fs::File::create(path)
-        .await
-        .map_err(|e| ApiError::Io(e.to_string()))?;
-    
-    // Используем timeout для предотвращения зависания task
-    let file_task = tokio::spawn(async move {
-        let mut file = file;
-        let mut total_size = 0;
-        const MAX_STREAM_SIZE: usize = 100 * 1024 * 1024; // 100MB limit для stream
-        
-        while let Some(chunk) = rx.recv().await {
-            total_size += chunk.len();
-            if total_size > MAX_STREAM_SIZE {
-                tracing::warn!("Stream exceeded size limit: {} bytes", total_size);
-                break;
-            }
-            
-            if file.write_all(&chunk).await.is_err() {
-                tracing::error!("Failed to write chunk to file");
-                break;
-            }
-        }
-        
-        // Явно закрываем файл
-        let _ = file.flush().await;
-        let _ = file.sync_all().await;
-    });
-    
-    // Добавляем timeout для task
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), file_task).await;
+    let state = Arc::new(Mutex::new((
+        tokio_fs::File::create(path)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?,
+        0usize,
+    )));
+    const MAX_STREAM_SIZE: usize = 100 * 1024 * 1024; // 100MB limit для stream
+    let stream_state = state.clone();
     let stream = resp.bytes_stream().then(move |item| {
-        let tx = tx.clone();
+        let state = stream_state.clone();
         async move {
             match item {
                 Ok(chunk) => {
-                    let _ = tx.send(chunk.clone()).await;
+                    let mut guard = state.lock().await;
+                    guard.1 += chunk.len();
+                    if guard.1 > MAX_STREAM_SIZE {
+                        tracing::warn!("Stream exceeded size limit: {} bytes", guard.1);
+                        return Err(actix_web::error::ErrorPayloadTooLarge("stream too big"));
+                    }
+                    if let Err(e) = guard.0.write_all(&chunk).await {
+                        tracing::error!("Failed to write chunk to file: {e}");
+                    }
                     Ok::<Bytes, actix_web::Error>(chunk)
                 }
                 Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
             }
+        }
+    });
+    let finalize_state = state.clone();
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        loop {
+            if Arc::strong_count(&finalize_state) == 1 {
+                let mut guard = finalize_state.lock().await;
+                let _ = guard.0.flush().await;
+                let _ = guard.0.sync_all().await;
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
         }
     });
     Ok(HttpResponse::Ok().content_type(ct).streaming(stream))
@@ -317,7 +319,7 @@ pub async fn get_original_image_prefixed(
 #[get("/health/memory")]
 pub async fn get_memory_stats() -> Result<HttpResponse, ApiError> {
     let (lock_count, cleanup_counter, active_tasks) = get_locks_stats();
-    
+
     #[cfg(target_os = "linux")]
     let memory_info = {
         if let Ok(contents) = std::fs::read_to_string("/proc/self/status") {
@@ -338,10 +340,10 @@ pub async fn get_memory_stats() -> Result<HttpResponse, ApiError> {
             "Unknown".to_string()
         }
     };
-    
+
     #[cfg(not(target_os = "linux"))]
     let memory_info = "Not available on this platform".to_string();
-    
+
     let stats = serde_json::json!({
         "memory_usage": memory_info,
         "active_locks": lock_count,
@@ -349,7 +351,7 @@ pub async fn get_memory_stats() -> Result<HttpResponse, ApiError> {
         "active_tasks": active_tasks,
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
-    
+
     Ok(HttpResponse::Ok().json(stats))
 }
 
@@ -362,12 +364,12 @@ pub async fn get_memory_stats() -> Result<HttpResponse, ApiError> {
 #[post("/health/cleanup")]
 pub async fn force_cleanup() -> Result<HttpResponse, ApiError> {
     force_cleanup_locks().await;
-    
+
     let response = serde_json::json!({
         "status": "cleanup_completed",
         "message": "All locks have been force cleaned",
         "timestamp": chrono::Utc::now().to_rfc3339()
     });
-    
+
     Ok(HttpResponse::Ok().json(response))
 }
