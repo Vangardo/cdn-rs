@@ -399,6 +399,11 @@ fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiErro
         return Err(ApiError::Img("resize result has zero dimensions".into()));
     }
 
+    // Явно освобождаем временные буферы и просим ОС вернуть память
+    drop(resizer);
+    drop(src);
+    release_memory();
+
     Ok(result)
 }
 
@@ -509,16 +514,19 @@ pub async fn save_img_from_url(
     let img = image::load_from_memory(&buf)
         .map_err(|e| ApiError::Img(format!("invalid image data: {}", e)))?;
 
+    let (img_w, img_h) = (img.width(), img.height());
     // Проверяем размеры изображения
-    if img.width() > MAX_IMAGE_DIMENSION || img.height() > MAX_IMAGE_DIMENSION {
+    if img_w > MAX_IMAGE_DIMENSION || img_h > MAX_IMAGE_DIMENSION {
+        drop(img);
+        release_memory();
         return Err(ApiError::BadRequest(format!(
             "image dimensions too large: {}x{} (max: {}x{})",
-            img.width(),
-            img.height(),
-            MAX_IMAGE_DIMENSION,
-            MAX_IMAGE_DIMENSION
+            img_w, img_h, MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION
         )));
     }
+
+    drop(img);
+    release_memory();
 
     Ok(buf)
 }
@@ -572,7 +580,7 @@ pub async fn convert_and_save_jpg(
     }
 
     let permit = BLOCKING_SEM.clone().acquire_owned().await.unwrap();
-    let _result = task::spawn_blocking(move || -> Result<(), ApiError> {
+    let blocking_res = task::spawn_blocking(move || -> Result<(), ApiError> {
         let _permit = permit; // permit автоматически освободится при drop
 
         // Проверяем, что это валидное изображение
@@ -605,10 +613,17 @@ pub async fn convert_and_save_jpg(
             .map_err(|e| ApiError::Img(format!("JPEG encoding failed: {}", e)))?;
 
         fs::write(&out_path, &buf).map_err(|e| ApiError::Io(e.to_string()))?;
+
+        drop(buf);
+        drop(rgb);
+        drop(img);
+        release_memory();
         Ok(())
     })
     .await
-    .map_err(|_| ApiError::Internal)??;
+    .map_err(|_| ApiError::Internal)?;
+    release_memory();
+    blocking_res?;
 
     // Уменьшаем счетчик активных задач
     {
@@ -618,6 +633,7 @@ pub async fn convert_and_save_jpg(
     }
 
     db.update_image_status(id, 4).await?;
+    release_memory();
     if !settings.production_mode {
         tracing::info!(
             "convert_and_save_jpg took {}ms",
@@ -770,7 +786,7 @@ pub async fn get_resize_image_bytes(
         let input_path_clone = input_path.clone();
         let no_image_path_clone = no_image_path.clone();
         let disk_path_clone = disk_path.clone();
-        task::spawn_blocking(move || -> Result<(), ApiError> {
+        let blocking_res = task::spawn_blocking(move || -> Result<(), ApiError> {
             let _permit = permit; // permit автоматически освободится при drop
 
             // Проверяем размер данных перед обработкой
@@ -968,10 +984,11 @@ pub async fn get_resize_image_bytes(
             Ok(())
         })
         .await
-        .map_err(|_| ApiError::Internal)??;
+        .map_err(|_| ApiError::Internal)?;
 
         // Try to release the memory held by intermediate buffers
         release_memory();
+        blocking_res?;
         Ok(())
     })
     .await?;
@@ -989,5 +1006,6 @@ pub async fn get_resize_image_bytes(
             started.elapsed().as_millis()
         );
     }
+    release_memory();
     Ok(())
 }
