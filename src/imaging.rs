@@ -132,10 +132,20 @@ async fn cleanup_old_locks() {
             if active_tasks > 0 {
                 tracing::info!("Active tasks: {}", active_tasks);
             }
-            
+
+            // Получаем текущее количество блокировок для отчета
+            let lock_count = VARIANT_LOCKS
+                .try_lock()
+                .map(|locks| locks.len())
+                .unwrap_or(0);
+
             // Логируем общую статистику
-            tracing::info!("Cleanup stats - Locks: {}, Tasks: {}, Counter: {}", 
-                locks.len(), active_tasks, *counter);
+            tracing::info!(
+                "Cleanup stats - Locks: {}, Tasks: {}, Counter: {}",
+                lock_count,
+                active_tasks,
+                *counter,
+            );
         }
     }
 }
