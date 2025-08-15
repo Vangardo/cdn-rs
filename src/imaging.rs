@@ -8,7 +8,11 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use std::{
     collections::HashMap,
-    fs, io::Cursor, path::Path, sync::Arc, time::{Duration, Instant},
+    fs,
+    io::Cursor,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::{
     fs as tokio_fs,
@@ -24,8 +28,7 @@ const MAX_IMAGE_DIMENSION: u32 = 8192; // 8K
 const LOCK_CLEANUP_INTERVAL: u32 = 5; // очистка каждые 5 запросов (еще чаще)
 const LOCK_TTL_SECONDS: u64 = 30; // TTL для блокировок: 30 секунд (еще меньше)
 
-static BLOCKING_SEM: Lazy<Arc<Semaphore>> =
-    Lazy::new(|| Arc::new(Semaphore::new(num_cpus::get()))); // Уменьшаем количество слотов
+static BLOCKING_SEM: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(num_cpus::get()))); // Уменьшаем количество слотов
 
 // Добавляем счетчик активных задач для мониторинга
 static ACTIVE_TASKS: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(0));
@@ -54,25 +57,33 @@ async fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     f.flush().await?;
     f.sync_all().await?;
     drop(f);
-    
+
     // Принудительно освобождаем файловые буферы
     #[cfg(target_os = "linux")]
     {
-        if let Ok(_) = std::process::Command::new("sync").arg("-f").arg(&tmp).status() {
+        if let Ok(_) = std::process::Command::new("sync")
+            .arg("-f")
+            .arg(&tmp)
+            .status()
+        {
             // Синхронизируем конкретный файл
         }
     }
-    
+
     tokio_fs::rename(&tmp, path).await?;
-    
+
     // Финальная синхронизация
     #[cfg(target_os = "linux")]
     {
-        if let Ok(_) = std::process::Command::new("sync").arg("-f").arg(path).status() {
+        if let Ok(_) = std::process::Command::new("sync")
+            .arg("-f")
+            .arg(path)
+            .status()
+        {
             // Синхронизируем финальный файл
         }
     }
-    
+
     Ok(())
 }
 
@@ -83,7 +94,7 @@ struct LockEntry {
 }
 
 // Заменяем DashMap на более простую структуру с ручной очисткой
-static VARIANT_LOCKS: Lazy<Mutex<HashMap<String, LockEntry>>> = 
+static VARIANT_LOCKS: Lazy<Mutex<HashMap<String, LockEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Счетчик для периодической очистки
@@ -98,16 +109,18 @@ async fn cleanup_old_locks() {
                 let now = Instant::now();
                 let ttl = Duration::from_secs(LOCK_TTL_SECONDS);
                 let before_count = locks.len();
-                locks.retain(|_, entry| {
-                    now.duration_since(entry.last_used) < ttl
-                });
+                locks.retain(|_, entry| now.duration_since(entry.last_used) < ttl);
                 let after_count = locks.len();
                 let cleaned = before_count - after_count;
                 if cleaned > 0 {
-                    tracing::info!("Cleaned up {} old locks, remaining: {}", cleaned, after_count);
+                    tracing::info!(
+                        "Cleaned up {} old locks, remaining: {}",
+                        cleaned,
+                        after_count
+                    );
                 }
             }
-            
+
             // Принудительно вызываем сборщик мусора (если доступен)
             #[cfg(target_os = "linux")]
             {
@@ -115,18 +128,28 @@ async fn cleanup_old_locks() {
                 if let Ok(_) = std::process::Command::new("sync").status() {
                     tracing::debug!("Called sync to flush filesystem buffers");
                 }
-                
+
                 // Попытка очистить кэш файловой системы
-                if let Ok(_) = std::process::Command::new("echo").arg("3").arg(">").arg("/proc/sys/vm/drop_caches").status() {
+                if let Ok(_) = std::process::Command::new("echo")
+                    .arg("3")
+                    .arg(">")
+                    .arg("/proc/sys/vm/drop_caches")
+                    .status()
+                {
                     tracing::debug!("Attempted to drop page cache");
                 }
-                
+
                 // Попытка освободить неиспользуемую память
-                if let Ok(_) = std::process::Command::new("echo").arg("1").arg(">").arg("/proc/sys/vm/compact_memory").status() {
+                if let Ok(_) = std::process::Command::new("echo")
+                    .arg("1")
+                    .arg(">")
+                    .arg("/proc/sys/vm/compact_memory")
+                    .status()
+                {
                     tracing::debug!("Attempted to compact memory");
                 }
             }
-            
+
             // Логируем статистику активных задач
             let active_tasks = get_active_tasks_count();
             if active_tasks > 0 {
@@ -157,27 +180,32 @@ pub async fn force_cleanup_locks() {
         locks.clear();
         tracing::info!("Force cleaned up {} locks", count);
     }
-    
+
     // Принудительно очищаем счетчик активных задач
     if let Ok(mut counter) = CLEANUP_COUNTER.try_lock() {
         *counter = 0;
     }
-    
+
     // Принудительно очищаем счетчик активных задач
     if let Ok(mut tasks) = ACTIVE_TASKS.try_lock() {
         *tasks = 0;
         tracing::info!("Reset active tasks counter to 0");
     }
-    
+
     // Принудительная очистка файловых буферов
     #[cfg(target_os = "linux")]
     {
         if let Ok(_) = std::process::Command::new("sync").status() {
             tracing::info!("Force synced filesystem buffers");
         }
-        
+
         // Попытка очистить кэш файловой системы (требует root)
-        if let Ok(_) = std::process::Command::new("echo").arg("3").arg(">").arg("/proc/sys/vm/drop_caches").status() {
+        if let Ok(_) = std::process::Command::new("echo")
+            .arg("3")
+            .arg(">")
+            .arg("/proc/sys/vm/drop_caches")
+            .status()
+        {
             tracing::info!("Attempted to drop page cache");
         }
     }
@@ -185,10 +213,12 @@ pub async fn force_cleanup_locks() {
 
 // Функция для получения статистики блокировок
 pub fn get_locks_stats() -> (usize, u32, usize) {
-    let lock_count = VARIANT_LOCKS.try_lock()
+    let lock_count = VARIANT_LOCKS
+        .try_lock()
         .map(|locks| locks.len())
         .unwrap_or(0);
-    let cleanup_counter = CLEANUP_COUNTER.try_lock()
+    let cleanup_counter = CLEANUP_COUNTER
+        .try_lock()
         .map(|counter| *counter)
         .unwrap_or(0);
     let active_tasks = get_active_tasks_count();
@@ -208,14 +238,21 @@ where
         entry.last_used = Instant::now();
         entry.lock.clone()
     };
-    
+
     let guard = lock.lock().await;
     let result = fut.await;
     drop(guard);
-    
-    // Периодическая очистка
+
+    {
+        let mut locks = VARIANT_LOCKS.lock().await;
+        if let Some(entry) = locks.get(key) {
+            if Arc::strong_count(&entry.lock) == 1 {
+                locks.remove(key);
+            }
+        }
+    }
+
     cleanup_old_locks().await;
-    
     result
 }
 
@@ -373,7 +410,7 @@ pub async fn save_img_from_url(
             resp.status()
         )));
     }
-    
+
     // Проверяем content-type
     if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
         let ok = ct
@@ -385,7 +422,7 @@ pub async fn save_img_from_url(
             return Err(ApiError::Img(format!("bad content-type: {ct:?}")));
         }
     }
-    
+
     // Проверяем размер файла до загрузки
     let content_length = resp.content_length();
     if let Some(cl) = content_length {
@@ -396,40 +433,44 @@ pub async fn save_img_from_url(
             )));
         }
     }
-    
+
     let bytes = resp
         .bytes()
         .await
         .map_err(|e| ApiError::Io(e.to_string()))?;
-    
+
     // Проверяем размер после загрузки
     if bytes.len() > MAX_IMAGE_SIZE {
         return Err(ApiError::BadRequest(format!(
             "image too large: {} bytes (max: {} bytes)",
-            bytes.len(), MAX_IMAGE_SIZE
+            bytes.len(),
+            MAX_IMAGE_SIZE
         )));
     }
-    
+
     if let Some(cl) = content_length {
         if bytes.len() as u64 != cl {
             return Err(ApiError::Img("truncated download".into()));
         }
     }
-    
+
     let buf = bytes.to_vec();
-    
+
     // Проверяем, что это валидное изображение и получаем его размеры
     let img = image::load_from_memory(&buf)
         .map_err(|e| ApiError::Img(format!("invalid image data: {}", e)))?;
-    
+
     // Проверяем размеры изображения
     if img.width() > MAX_IMAGE_DIMENSION || img.height() > MAX_IMAGE_DIMENSION {
         return Err(ApiError::BadRequest(format!(
             "image dimensions too large: {}x{} (max: {}x{})",
-            img.width(), img.height(), MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION
+            img.width(),
+            img.height(),
+            MAX_IMAGE_DIMENSION,
+            MAX_IMAGE_DIMENSION
         )));
     }
-    
+
     atomic_write(output_path, &buf)
         .await
         .map_err(|e| ApiError::Io(e.to_string()))?;
@@ -453,15 +494,17 @@ pub async fn convert_and_save_jpg(
         .map_err(|e| ApiError::Io(e.to_string()))?;
 
     let base64_img = base64_img.trim();
-    
+
     // Проверяем размер base64 строки
-    if base64_img.len() > MAX_IMAGE_SIZE * 2 { // base64 примерно в 1.33 раза больше
+    if base64_img.len() > MAX_IMAGE_SIZE * 2 {
+        // base64 примерно в 1.33 раза больше
         return Err(ApiError::BadRequest(format!(
             "base64 image too large: {} chars (max: {} chars)",
-            base64_img.len(), MAX_IMAGE_SIZE * 2
+            base64_img.len(),
+            MAX_IMAGE_SIZE * 2
         )));
     }
-    
+
     let decoded = BASE64
         .decode(base64_img)
         .map_err(|e| ApiError::BadRequest(format!("invalid base64: {}", e)))?;
@@ -470,7 +513,8 @@ pub async fn convert_and_save_jpg(
     if decoded.len() > MAX_IMAGE_SIZE {
         return Err(ApiError::BadRequest(format!(
             "decoded image too large: {} bytes (max: {} bytes)",
-            decoded.len(), MAX_IMAGE_SIZE
+            decoded.len(),
+            MAX_IMAGE_SIZE
         )));
     }
 
@@ -480,23 +524,25 @@ pub async fn convert_and_save_jpg(
             *count += 1;
         }
     }
-    
+
     let permit = BLOCKING_SEM.clone().acquire_owned().await.unwrap();
     let _result = task::spawn_blocking(move || -> Result<(), ApiError> {
         let _permit = permit; // permit автоматически освободится при drop
-        
+
         // Проверяем, что это валидное изображение
-        let img = image::load_from_memory(&decoded)
-            .map_err(|e| ApiError::Img(e.to_string()))?;
-        
+        let img = image::load_from_memory(&decoded).map_err(|e| ApiError::Img(e.to_string()))?;
+
         // Проверяем размеры изображения
         if img.width() > MAX_IMAGE_DIMENSION || img.height() > MAX_IMAGE_DIMENSION {
             return Err(ApiError::BadRequest(format!(
                 "image dimensions too large: {}x{} (max: {}x{})",
-                img.width(), img.height(), MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION
+                img.width(),
+                img.height(),
+                MAX_IMAGE_DIMENSION,
+                MAX_IMAGE_DIMENSION
             )));
         }
-        
+
         let rgb = img.to_rgb8();
 
         // Используем image crate для JPEG-кодирования
@@ -517,7 +563,7 @@ pub async fn convert_and_save_jpg(
     })
     .await
     .map_err(|_| ApiError::Internal)??;
-    
+
     // Уменьшаем счетчик активных задач
     {
         if let Ok(mut count) = ACTIVE_TASKS.try_lock() {
@@ -669,45 +715,48 @@ pub async fn get_resize_image_bytes(
                 *count += 1;
             }
         }
-        
+
         let permit = BLOCKING_SEM.clone().acquire_owned().await.unwrap();
         let input_path_clone = input_path.clone();
         let no_image_path_clone = no_image_path.clone();
         let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
             let _permit = permit; // permit автоматически освободится при drop
-            
+
             // Проверяем размер данных перед обработкой
             let data = if let Some(b) = downloaded {
                 if b.len() > MAX_IMAGE_SIZE {
                     return Err(ApiError::BadRequest(format!(
                         "downloaded image too large: {} bytes (max: {} bytes)",
-                        b.len(), MAX_IMAGE_SIZE
+                        b.len(),
+                        MAX_IMAGE_SIZE
                     )));
                 }
                 b
             } else if Path::new(&input_path_clone).exists() {
-                let file_data = fs::read(&input_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
+                let file_data =
+                    fs::read(&input_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
                 if file_data.len() > MAX_IMAGE_SIZE {
                     return Err(ApiError::BadRequest(format!(
                         "file image too large: {} bytes (max: {} bytes)",
-                        file_data.len(), MAX_IMAGE_SIZE
+                        file_data.len(),
+                        MAX_IMAGE_SIZE
                     )));
                 }
                 file_data
             } else {
-                let no_img_data = fs::read(&no_image_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
+                let no_img_data =
+                    fs::read(&no_image_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
                 if no_img_data.len() > MAX_IMAGE_SIZE {
                     return Err(ApiError::BadRequest(format!(
                         "no-image file too large: {} bytes (max: {} bytes)",
-                        no_img_data.len(), MAX_IMAGE_SIZE
+                        no_img_data.len(),
+                        MAX_IMAGE_SIZE
                     )));
                 }
                 no_img_data
             };
 
-            // early_ct больше не нужен - убрали проблемную логику
             let (mut rgb, tw, th) = {
-                // Используем только image crate для декодирования - убираем проблемное DCT-декодирование mozjpeg
                 let img = if data.is_empty() {
                     DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
                 } else {
@@ -751,8 +800,6 @@ pub async fn get_resize_image_bytes(
 
                 (rgb, tw, th)
             };
-
-            // early_ct больше не используется
 
             let bg_is_default = bg_hex_owned
                 .as_deref()
@@ -803,7 +850,6 @@ pub async fn get_resize_image_bytes(
             let mut buf = Vec::new();
             match fmt {
                 ImageFormat::Jpeg => {
-                    // Используем image crate вместо проблемного mozjpeg Compress
                     let mut cur = Cursor::new(&mut buf);
                     let mut encoder =
                         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, JPEG_Q as u8);
@@ -846,10 +892,12 @@ pub async fn get_resize_image_bytes(
         atomic_write(&disk_path, &buf)
             .await
             .map_err(|e| ApiError::Io(e.to_string()))?;
+        let mut buf = buf;
+        buf.shrink_to_fit();
         Ok((buf, ct))
     })
     .await?;
-    
+
     // Уменьшаем счетчик активных задач
     {
         if let Ok(mut count) = ACTIVE_TASKS.try_lock() {
