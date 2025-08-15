@@ -4,7 +4,6 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::{
-    cache::Cache,
     config::Settings,
     db::Db,
     errors::ApiError,
@@ -142,7 +141,6 @@ pub async fn get_resize_image_root(
     db: web::Data<Db>,
     settings: web::Data<Settings>,
     client: web::Data<Client>,
-    cache: web::Data<Cache>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, param) = path.into_inner();
     let mut parts = param.split('x');
@@ -173,7 +171,6 @@ pub async fn get_resize_image_root(
         &db,
         &settings,
         &client,
-        &cache,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
@@ -219,7 +216,6 @@ pub async fn get_image_with_format(
     db: web::Data<Db>,
     settings: web::Data<Settings>,
     client: web::Data<Client>,
-    cache: web::Data<Cache>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, mut format) = path.into_inner();
     let valid = ["JPEG", "PNG", "GIF", "TIFF", "WebP"];
@@ -235,7 +231,6 @@ pub async fn get_image_with_format(
         &db,
         &settings,
         &client,
-        &cache,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))
@@ -253,7 +248,6 @@ pub async fn get_resize_image_prefixed(
     db: web::Data<Db>,
     settings: web::Data<Settings>,
     client: web::Data<Client>,
-    cache: web::Data<Cache>,
 ) -> Result<HttpResponse, ApiError> {
     let (guid, param) = path.into_inner();
     let mut parts = param.split('x');
@@ -270,7 +264,6 @@ pub async fn get_resize_image_prefixed(
         &db,
         &settings,
         &client,
-        &cache,
     )
     .await?;
     Ok(HttpResponse::Ok().content_type(ct).body(bytes))

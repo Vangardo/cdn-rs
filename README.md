@@ -90,11 +90,6 @@ cdn-rs/
 | `NO_IMAGE_FILE` | Имя файла-заглушки внутри `MEDIA_BASE_DIR` | `no-image-01.jpg` |
 | `MAX_IMAGE_SIDE` | Лимит на сторону при ресайзе | `1600` |
 | `DATABASE_URL` | Строка подключения к Postgres | — (обязательна) |
-| `USE_CACHE` | Включить Redis-кэш (`true`/`false`) | `false` |
-| `REDIS_HOST` | Хост Redis | `127.0.0.1` |
-| `REDIS_PORT` | Порт Redis | `6379` |
-| `REDIS_DB` | Номер базы Redis | `0` |
-| `REDIS_PASSWORD` | Пароль Redis | _пусто_ |
 | `SWAGGER_ENABLED` | Включить Swagger UI (`true`/`false`) | `true` |
 | `SWAGGER_TITLE` | Заголовок для Swagger | `Onlihub Media CDN` |
 | `SWAGGER_VERSION` | Версия API в Swagger | `1.0.0` |

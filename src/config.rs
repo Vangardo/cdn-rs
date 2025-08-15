@@ -8,11 +8,6 @@ pub struct Settings {
     pub no_image_file: String,  // relative to media_base_dir, как в Python
     pub max_image_side: u32,
     pub database_url: String,
-    pub use_cache: bool,
-    pub redis_host: String,
-    pub redis_port: u16,
-    pub redis_db: u8,
-    pub redis_password: String,
     pub swagger_enabled: bool,
     pub swagger_title: String,
     pub swagger_version: String,
@@ -34,21 +29,6 @@ impl Settings {
         let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://postgres:0X90uyyz8QKMmV7jlJiQ@65.21.189.170:5432/tradeshow".into()
         });
-
-        let use_cache = env::var("USE_CACHE")
-            .map(|s| s == "true" || s == "1")
-            .unwrap_or(false);
-
-        let redis_host = env::var("REDIS_HOST").unwrap_or_else(|_| "172.26.0.6".into());
-        let redis_port = env::var("REDIS_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6379);
-        let redis_db = env::var("REDIS_DB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8);
-        let redis_password = env::var("REDIS_PASSWORD").unwrap_or_default();
 
         let swagger_enabled = env::var("SWAGGER_ENABLED")
             .map(|s| s == "true" || s == "1")
@@ -72,11 +52,6 @@ impl Settings {
             no_image_file,
             max_image_side,
             database_url,
-            use_cache,
-            redis_host,
-            redis_port,
-            redis_db,
-            redis_password,
             swagger_enabled,
             swagger_title,
             swagger_version,
@@ -87,19 +62,5 @@ impl Settings {
 
     pub fn no_image_full_path(&self) -> String {
         format!("{}{}", self.media_base_dir, self.no_image_file)
-    }
-
-    pub fn redis_url(&self) -> String {
-        if self.redis_password.is_empty() {
-            format!(
-                "redis://{}:{}/{}",
-                self.redis_host, self.redis_port, self.redis_db
-            )
-        } else {
-            format!(
-                "redis://:{}@{}:{}/{}",
-                self.redis_password, self.redis_host, self.redis_port, self.redis_db
-            )
-        }
     }
 }
