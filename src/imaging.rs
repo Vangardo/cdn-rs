@@ -12,12 +12,13 @@ use std::{fs, io::Cursor, path::Path, sync::Arc, time::Instant};
 use tokio::{
     fs as tokio_fs,
     io::AsyncWriteExt,
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     task,
 };
 use uuid::Uuid;
 
-static BLOCKING_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(num_cpus::get() * 2)); // Увеличиваем параллельность
+static BLOCKING_SEM: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(num_cpus::get() * 2))); // Увеличиваем параллельность
 
 const JPEG_Q: f32 = 85.0; // Увеличиваем качество для лучшего результата
 
@@ -44,18 +45,30 @@ async fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 
 static VARIANT_LOCKS: Lazy<DashMap<String, Arc<Mutex<()>>>> = Lazy::new(DashMap::new);
 
+struct VariantLockGuard {
+    key: String,
+}
+
+impl Drop for VariantLockGuard {
+    fn drop(&mut self) {
+        VARIANT_LOCKS.remove(&self.key);
+    }
+}
+
 async fn with_variant_lock<T, F>(key: &str, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
+    let key_owned = key.to_string();
     let lock = VARIANT_LOCKS
-        .entry(key.to_string())
+        .entry(key_owned.clone())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone();
+    let map_guard = VariantLockGuard { key: key_owned };
     let guard = lock.lock().await;
     let result = fut.await;
     drop(guard);
-    VARIANT_LOCKS.remove(key);
+    drop(map_guard);
     result
 }
 
@@ -70,7 +83,7 @@ fn target_and_foreground(
     if orig_w == 0 || orig_h == 0 {
         return (1, 1, 1, 1, false);
     }
-    
+
     // рамка (target)
     let mut tw = req_w.unwrap_or(orig_w).min(max_side);
     let mut th = req_h.unwrap_or(orig_h).min(max_side);
@@ -78,7 +91,7 @@ fn target_and_foreground(
         tw = orig_w.min(max_side);
         th = orig_h.min(max_side);
     }
-    
+
     // вписывание + баним апскейл
     let r = (tw as f32 / orig_w as f32)
         .min(th as f32 / orig_h as f32)
@@ -92,7 +105,7 @@ fn target_and_foreground(
     } else if req_h.is_some() && req_w.is_none() {
         tw = fg_w;
     }
-    
+
     // Финальная проверка - все размеры должны быть > 0
     let tw = tw.max(1);
     let th = th.max(1);
@@ -106,17 +119,19 @@ fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiErro
     if rgb.width() == dst_w && rgb.height() == dst_h {
         return Ok(rgb);
     }
-    
+
     // Проверяем на нулевые размеры
     if dst_w == 0 || dst_h == 0 {
-        return Err(ApiError::Img("invalid destination dimensions: zero size".into()));
+        return Err(ApiError::Img(
+            "invalid destination dimensions: zero size".into(),
+        ));
     }
-    
+
     // Проверяем, что исходное изображение не пустое
     if rgb.width() == 0 || rgb.height() == 0 {
         return Err(ApiError::Img("source image has zero dimensions".into()));
     }
-    
+
     if dst_w > rgb.width() || dst_h > rgb.height() {
         return Err(ApiError::Img("upscale not supported".into()));
     }
@@ -133,53 +148,48 @@ fn fir_resize(rgb: RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage, ApiErro
     // Сохраняем размеры до вызова into_raw()
     let width = rgb.width();
     let height = rgb.height();
-    
+
     let rgb_data = rgb.into_raw();
-    
+
     // Проверяем, что данные RGB корректны
     if rgb_data.len() != (width * height * 3) as usize {
         return Err(ApiError::Img("RGB data length mismatch".into()));
     }
-    
+
     // Проверяем, что нет некорректных значений RGB
     if rgb_data.iter().any(|&b| b > 255) {
         return Err(ApiError::Img("Invalid RGB values detected".into()));
     }
-    
-    let src = FirImage::from_vec_u8(
-        width,
-        height,
-        rgb_data,
-        fir::PixelType::U8x3,
-    )
-    .map_err(|e| ApiError::Img(e.to_string()))?;
+
+    let src = FirImage::from_vec_u8(width, height, rgb_data, fir::PixelType::U8x3)
+        .map_err(|e| ApiError::Img(e.to_string()))?;
     let mut dst = FirImage::new(dst_w, dst_h, fir::PixelType::U8x3);
     let mut resizer = fir::Resizer::new();
     let opts = fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(filter));
     resizer
         .resize(&src, &mut dst, &opts)
         .map_err(|e| ApiError::Img(e.to_string()))?;
-    
+
     let result_data = dst.into_vec();
-    
+
     // Проверяем, что результат ресайза корректный
     if result_data.len() != (dst_w * dst_h * 3) as usize {
         return Err(ApiError::Img("resize result data length mismatch".into()));
     }
-    
+
     let result = RgbImage::from_raw(dst_w, dst_h, result_data)
         .ok_or_else(|| ApiError::Img("resize failed".into()))?;
-    
+
     // Дополнительная проверка результата
     if result.width() != dst_w || result.height() != dst_h {
         return Err(ApiError::Img("resize result has wrong dimensions".into()));
     }
-    
+
     // Проверяем, что результат не пустой
     if result.width() == 0 || result.height() == 0 {
         return Err(ApiError::Img("resize result has zero dimensions".into()));
     }
-    
+
     Ok(result)
 }
 
@@ -267,28 +277,32 @@ pub async fn convert_and_save_jpg(
         .decode(base64_img)
         .map_err(|e| ApiError::BadRequest(format!("invalid base64: {}", e)))?;
 
-    let permit = BLOCKING_SEM.acquire().await.unwrap();
+    let permit = BLOCKING_SEM.clone().acquire_owned().await.unwrap();
     task::spawn_blocking(move || -> Result<(), ApiError> {
+        let _permit: OwnedSemaphorePermit = permit;
         // Используем только image crate - убираем проблемное mozjpeg
         let rgb = image::load_from_memory(&decoded)
             .map_err(|e| ApiError::Img(e.to_string()))?
             .to_rgb8();
-        
+
         // Используем image crate для JPEG-кодирования
         let mut buf = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-            &mut buf, 
-            JPEG_Q as u8
-        );
-        encoder.encode(&rgb, rgb.width(), rgb.height(), image::ColorType::Rgb8.into())
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, JPEG_Q as u8);
+        encoder
+            .encode(
+                &rgb,
+                rgb.width(),
+                rgb.height(),
+                image::ColorType::Rgb8.into(),
+            )
             .map_err(|e| ApiError::Img(format!("JPEG encoding failed: {}", e)))?;
-        
+
         fs::write(&out_path, &buf).map_err(|e| ApiError::Io(e.to_string()))?;
         Ok(())
     })
     .await
     .map_err(|_| ApiError::Internal)??;
-    drop(permit);
 
     db.update_image_status(id, 4).await?;
     if !settings.production_mode {
@@ -428,10 +442,11 @@ pub async fn get_resize_image_bytes(
             return Ok((buf, ct_guess.clone()));
         }
 
-        let permit = BLOCKING_SEM.acquire().await.unwrap();
+        let permit = BLOCKING_SEM.clone().acquire_owned().await.unwrap();
         let input_path_clone = input_path.clone();
         let no_image_path_clone = no_image_path.clone();
         let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
+            let _permit: OwnedSemaphorePermit = permit;
             let data = if let Some(b) = downloaded {
                 b
             } else if Path::new(&input_path_clone).exists() {
@@ -448,17 +463,17 @@ pub async fn get_resize_image_bytes(
                 } else {
                     image::load_from_memory(&data).map_err(|e| ApiError::Img(e.to_string()))?
                 };
-                
+
                 let (sw, sh) = (img.width(), img.height());
-                
+
                 // Проверяем, что изображение не пустое
                 if sw == 0 || sh == 0 {
                     return Err(ApiError::Img("source image has zero dimensions".into()));
                 }
-                
+
                 let (tw, th, fg_w, fg_h, need_resize) =
                     target_and_foreground(sw, sh, width, height, max_side);
-                
+
                 // Проверяем, нужен ли ресайз вообще
                 if (width.is_some() || height.is_some())
                     && fg_w == sw
@@ -476,14 +491,14 @@ pub async fn get_resize_image_bytes(
                     // Если ресайз не нужен, возвращаем оригинал
                     return Ok((data, "image/jpeg".to_string()));
                 }
-                
+
                 let base = img.to_rgb8();
                 let rgb = if need_resize {
                     fir_resize(base, fg_w, fg_h)?
                 } else {
                     base
                 };
-                
+
                 (rgb, tw, th)
             };
 
@@ -496,30 +511,34 @@ pub async fn get_resize_image_bytes(
             if rgb.width() != tw || rgb.height() != th || !bg_is_default {
                 // Проверяем, что размеры корректны
                 if tw == 0 || th == 0 {
-                    return Err(ApiError::Img("invalid target dimensions for background".into()));
+                    return Err(ApiError::Img(
+                        "invalid target dimensions for background".into(),
+                    ));
                 }
-                
+
                 let (r, g, b) = hex_to_rgb(bg_hex_owned.as_deref().unwrap_or("ffffff"));
                 let mut bg = RgbImage::from_pixel(tw, th, image::Rgb([r, g, b]));
-                
+
                 // Безопасный расчет позиции для центрирования
-                let x = if rgb.width() <= tw { 
-                    ((tw - rgb.width()) / 2) as i64 
-                } else { 
-                    0 
+                let x = if rgb.width() <= tw {
+                    ((tw - rgb.width()) / 2) as i64
+                } else {
+                    0
                 };
-                let y = if rgb.height() <= th { 
-                    ((th - rgb.height()) / 2) as i64 
-                } else { 
-                    0 
+                let y = if rgb.height() <= th {
+                    ((th - rgb.height()) / 2) as i64
+                } else {
+                    0
                 };
-                
+
                 // Проверяем, что позиция не отрицательная
                 if x >= 0 && y >= 0 {
                     imageops::replace(&mut bg, &rgb, x, y);
                     rgb = bg;
                 } else {
-                    return Err(ApiError::Img("failed to position image on background".into()));
+                    return Err(ApiError::Img(
+                        "failed to position image on background".into(),
+                    ));
                 }
             }
 
@@ -536,11 +555,15 @@ pub async fn get_resize_image_bytes(
                 ImageFormat::Jpeg => {
                     // Используем image crate вместо проблемного mozjpeg Compress
                     let mut cur = Cursor::new(&mut buf);
-                    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                        &mut cur, 
-                        JPEG_Q as u8
-                    );
-                    encoder.encode(&rgb, rgb.width(), rgb.height(), image::ColorType::Rgb8.into())
+                    let mut encoder =
+                        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, JPEG_Q as u8);
+                    encoder
+                        .encode(
+                            &rgb,
+                            rgb.width(),
+                            rgb.height(),
+                            image::ColorType::Rgb8.into(),
+                        )
                         .map_err(|e| ApiError::Img(format!("JPEG encoding failed: {}", e)))?;
                 }
                 other => {
@@ -569,7 +592,6 @@ pub async fn get_resize_image_bytes(
         })
         .await
         .map_err(|_| ApiError::Internal)??;
-        drop(permit);
 
         atomic_write(&disk_path, &buf)
             .await

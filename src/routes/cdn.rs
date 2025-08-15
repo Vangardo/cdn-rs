@@ -108,7 +108,9 @@ async fn stream_original(
         .map_err(|e| ApiError::Io(e.to_string()))?;
     tokio::spawn(async move {
         while let Some(chunk) = rx.recv().await {
-            let _ = file.write_all(&chunk).await;
+            if file.write_all(&chunk).await.is_err() {
+                break;
+            }
         }
     });
     let stream = resp.bytes_stream().then(move |item| {
