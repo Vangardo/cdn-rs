@@ -14,6 +14,7 @@ use db::Db;
 use reqwest::Client;
 use tracing_subscriber::{fmt, EnvFilter};
 use utoipa::OpenApi;
+use std::time::Duration;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -46,6 +47,56 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = settings.bind_addr.clone();
     tracing::info!("Listening on {}", bind_addr);
 
+    // Запускаем мониторинг памяти
+    if !settings.production_mode {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30)); // Увеличиваем частоту мониторинга
+            loop {
+                interval.tick().await;
+                
+                // Получаем информацию о памяти (только для Linux/Unix)
+                #[cfg(target_os = "linux")]
+                {
+                    if let Ok(contents) = std::fs::read_to_string("/proc/self/status") {
+                        if let Some(mem_line) = contents.lines().find(|line| line.starts_with("VmRSS:")) {
+                            if let Some(kb_str) = mem_line.split_whitespace().nth(1) {
+                                if let Ok(kb) = kb_str.parse::<u64>() {
+                                    let mb = kb / 1024;
+                                    tracing::info!("Memory usage: {} MB", mb);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Для Windows используем другой подход
+                #[cfg(target_os = "windows")]
+                {
+                    // Windows не предоставляет простой способ получить RSS, 
+                    // но можно использовать системные API если нужно
+                    tracing::debug!("Memory monitoring on Windows (not implemented)");
+                }
+                
+                // Если память превышает 500MB, логируем предупреждение
+                #[cfg(target_os = "linux")]
+                {
+                    if let Ok(contents) = std::fs::read_to_string("/proc/self/status") {
+                        if let Some(mem_line) = contents.lines().find(|line| line.starts_with("VmRSS:")) {
+                            if let Some(kb_str) = mem_line.split_whitespace().nth(1) {
+                                if let Ok(kb) = kb_str.parse::<u64>() {
+                                    let mb = kb / 1024;
+                                    if mb > 500 {
+                                        tracing::warn!("High memory usage detected: {} MB", mb);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     HttpServer::new(move || {
         let swagger = if settings.swagger_enabled {
             Some(
@@ -67,7 +118,9 @@ async fn main() -> std::io::Result<()> {
             .service(routes::cdn::get_original_image_prefixed)
             .service(routes::cdn::get_image_with_format)
             .service(routes::cdn::get_resize_image_root)
-            .service(routes::cdn::get_original_image_root);
+            .service(routes::cdn::get_original_image_root)
+            .service(routes::cdn::get_memory_stats)
+            .service(routes::cdn::force_cleanup);
 
         if let Some(sw) = swagger {
             app = app.service(sw).route(
@@ -88,7 +141,7 @@ async fn main() -> std::io::Result<()> {
 
         app
     })
-    .workers(num_cpus::get()) // максимальное количество воркеров для производительности
+    .workers(num_cpus::get().min(8)) // ограничиваем количество воркеров для предотвращения переполнения памяти
     .bind(bind_addr)?
     .run()
     .await

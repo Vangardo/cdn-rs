@@ -22,8 +22,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 rand = "0.8"
 regex = "1"
 
-dashmap = "5"
-
 # БД
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros"] }
 
