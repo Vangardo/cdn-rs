@@ -31,7 +31,8 @@ const MAX_IMAGE_DIMENSION: u32 = 8192; // 8K
 const LOCK_CLEANUP_INTERVAL: u32 = 5; // очистка каждые 5 запросов (еще чаще)
 const LOCK_TTL_SECONDS: u64 = 30; // TTL для блокировок: 30 секунд (еще меньше)
 
-static BLOCKING_SEM: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(num_cpus::get()))); // Уменьшаем количество слотов
+static BLOCKING_SEM: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(std::cmp::max(2, num_cpus::get() / 2))));
 
 // Добавляем счетчик активных задач для мониторинга
 static ACTIVE_TASKS: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(0));
@@ -806,8 +807,8 @@ pub async fn get_resize_image_bytes(
                 no_img_data
             };
 
-            let (mut rgb, tw, th) = {
-                let mut data = data; // allow dropping early
+            let processing = {
+                let mut data = data;
                 let img = if data.is_empty() {
                     DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255])))
                 } else {
@@ -816,7 +817,6 @@ pub async fn get_resize_image_bytes(
 
                 let (sw, sh) = (img.width(), img.height());
 
-                // Проверяем, что изображение не пустое
                 if sw == 0 || sh == 0 {
                     return Err(ApiError::Img("source image has zero dimensions".into()));
                 }
@@ -824,7 +824,6 @@ pub async fn get_resize_image_bytes(
                 let (tw, th, fg_w, fg_h, need_resize) =
                     target_and_foreground(sw, sh, width, height, max_side);
 
-                // Проверяем, нужен ли ресайз вообще
                 if (width.is_some() || height.is_some())
                     && fg_w == sw
                     && fg_h == sh
@@ -838,7 +837,6 @@ pub async fn get_resize_image_bytes(
                         .map(|s| s.eq_ignore_ascii_case("ffffff"))
                         .unwrap_or(true)
                 {
-                    // Если ресайз не нужен, сохраняем оригинал на диск
                     use std::io::Write;
                     if let Some(parent) = std::path::Path::new(&disk_path_clone).parent() {
                         std::fs::create_dir_all(parent).map_err(|e| ApiError::Io(e.to_string()))?;
@@ -852,117 +850,116 @@ pub async fn get_resize_image_bytes(
                     std::fs::rename(&tmp, &disk_path_clone)
                         .map_err(|e| ApiError::Io(e.to_string()))?;
 
-                    let mut d = data;
-                    d.clear();
-                    d.shrink_to_fit();
-                    #[cfg(target_os = "linux")]
-                    unsafe {
-                        libc::malloc_trim(0);
+                    data.clear();
+                    data.shrink_to_fit();
+                    drop(data);
+                    None
+                } else {
+                    data.clear();
+                    data.shrink_to_fit();
+                    let base = img.to_rgb8();
+                    let rgb = if need_resize {
+                        fir_resize(base, fg_w, fg_h)?
+                    } else {
+                        base
+                    };
+                    Some((rgb, tw, th))
+                }
+            };
+
+            if let Some((mut rgb, tw, th)) = processing {
+                let bg_is_default = bg_hex_owned
+                    .as_deref()
+                    .unwrap_or("ffffff")
+                    .eq_ignore_ascii_case("ffffff");
+                if rgb.width() != tw || rgb.height() != th || !bg_is_default {
+                    if tw == 0 || th == 0 {
+                        return Err(ApiError::Img(
+                            "invalid target dimensions for background".into(),
+                        ));
                     }
-                    return Ok(());
+
+                    let (r, g, b) = hex_to_rgb(bg_hex_owned.as_deref().unwrap_or("ffffff"));
+                    let mut bg = RgbImage::from_pixel(tw, th, image::Rgb([r, g, b]));
+
+                    let x = if rgb.width() <= tw {
+                        ((tw - rgb.width()) / 2) as i64
+                    } else {
+                        0
+                    };
+                    let y = if rgb.height() <= th {
+                        ((th - rgb.height()) / 2) as i64
+                    } else {
+                        0
+                    };
+
+                    if x >= 0 && y >= 0 {
+                        imageops::replace(&mut bg, &rgb, x, y);
+                        rgb = bg;
+                    } else {
+                        return Err(ApiError::Img(
+                            "failed to position image on background".into(),
+                        ));
+                    }
                 }
 
-                // Оригинальные данные больше не нужны
-                data.clear();
-                data.shrink_to_fit();
-
-                let base = img.to_rgb8();
-                let rgb = if need_resize {
-                    fir_resize(base, fg_w, fg_h)?
-                } else {
-                    base
+                let fmt = match fmt_owned.as_deref() {
+                    Some("PNG") => ImageFormat::Png,
+                    Some("GIF") => ImageFormat::Gif,
+                    Some("TIFF") => ImageFormat::Tiff,
+                    Some("WEBP") => ImageFormat::WebP,
+                    _ => ImageFormat::Jpeg,
                 };
 
-                (rgb, tw, th)
-            };
-
-            let bg_is_default = bg_hex_owned
-                .as_deref()
-                .unwrap_or("ffffff")
-                .eq_ignore_ascii_case("ffffff");
-            if rgb.width() != tw || rgb.height() != th || !bg_is_default {
-                // Проверяем, что размеры корректны
-                if tw == 0 || th == 0 {
-                    return Err(ApiError::Img(
-                        "invalid target dimensions for background".into(),
-                    ));
+                let mut buf = Vec::new();
+                {
+                    let rgb_local = rgb;
+                    match fmt {
+                        ImageFormat::Jpeg => {
+                            let mut cur = Cursor::new(&mut buf);
+                            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                                &mut cur,
+                                JPEG_Q as u8,
+                            );
+                            encoder
+                                .encode(
+                                    &rgb_local,
+                                    rgb_local.width(),
+                                    rgb_local.height(),
+                                    image::ColorType::Rgb8.into(),
+                                )
+                                .map_err(|e| {
+                                    ApiError::Img(format!("JPEG encoding failed: {}", e))
+                                })?;
+                        }
+                        other => {
+                            let mut cur = Cursor::new(&mut buf);
+                            DynamicImage::ImageRgb8(rgb_local)
+                                .write_to(&mut cur, other)
+                                .map_err(|e| ApiError::Img(e.to_string()))?;
+                        }
+                    }
                 }
 
-                let (r, g, b) = hex_to_rgb(bg_hex_owned.as_deref().unwrap_or("ffffff"));
-                let mut bg = RgbImage::from_pixel(tw, th, image::Rgb([r, g, b]));
-
-                // Безопасный расчет позиции для центрирования
-                let x = if rgb.width() <= tw {
-                    ((tw - rgb.width()) / 2) as i64
-                } else {
-                    0
-                };
-                let y = if rgb.height() <= th {
-                    ((th - rgb.height()) / 2) as i64
-                } else {
-                    0
-                };
-
-                // Проверяем, что позиция не отрицательная
-                if x >= 0 && y >= 0 {
-                    imageops::replace(&mut bg, &rgb, x, y);
-                    rgb = bg;
-                } else {
-                    return Err(ApiError::Img(
-                        "failed to position image on background".into(),
-                    ));
+                if buf.is_empty() {
+                    return Err(ApiError::Img("generated image buffer is empty".into()));
                 }
-            }
 
-            let fmt = match fmt_owned.as_deref() {
-                Some("PNG") => ImageFormat::Png,
-                Some("GIF") => ImageFormat::Gif,
-                Some("TIFF") => ImageFormat::Tiff,
-                Some("WEBP") => ImageFormat::WebP,
-                _ => ImageFormat::Jpeg,
-            };
-
-            let mut buf = Vec::new();
-            match fmt {
-                ImageFormat::Jpeg => {
-                    let mut cur = Cursor::new(&mut buf);
-                    let mut encoder =
-                        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, JPEG_Q as u8);
-                    encoder
-                        .encode(
-                            &rgb,
-                            rgb.width(),
-                            rgb.height(),
-                            image::ColorType::Rgb8.into(),
-                        )
-                        .map_err(|e| ApiError::Img(format!("JPEG encoding failed: {}", e)))?;
+                use std::io::Write;
+                if let Some(parent) = std::path::Path::new(&disk_path_clone).parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| ApiError::Io(e.to_string()))?;
                 }
-                other => {
-                    let mut cur = Cursor::new(&mut buf);
-                    DynamicImage::ImageRgb8(rgb)
-                        .write_to(&mut cur, other)
-                        .map_err(|e| ApiError::Img(e.to_string()))?;
-                }
+                let tmp = format!("{disk_path_clone}.part");
+                let mut f = std::fs::File::create(&tmp).map_err(|e| ApiError::Io(e.to_string()))?;
+                f.write_all(&buf).map_err(|e| ApiError::Io(e.to_string()))?;
+                f.sync_all().map_err(|e| ApiError::Io(e.to_string()))?;
+                std::fs::rename(&tmp, &disk_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
+
+                buf.clear();
+                buf.shrink_to_fit();
+                drop(buf);
             }
 
-            if buf.is_empty() {
-                return Err(ApiError::Img("generated image buffer is empty".into()));
-            }
-
-            // Write directly to disk
-            use std::io::Write;
-            if let Some(parent) = std::path::Path::new(&disk_path_clone).parent() {
-                std::fs::create_dir_all(parent).map_err(|e| ApiError::Io(e.to_string()))?;
-            }
-            let tmp = format!("{disk_path_clone}.part");
-            let mut f = std::fs::File::create(&tmp).map_err(|e| ApiError::Io(e.to_string()))?;
-            f.write_all(&buf).map_err(|e| ApiError::Io(e.to_string()))?;
-            f.sync_all().map_err(|e| ApiError::Io(e.to_string()))?;
-            std::fs::rename(&tmp, &disk_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
-
-            let mut b = buf;
-            b.clear();
-            b.shrink_to_fit();
             #[cfg(target_os = "linux")]
             unsafe {
                 libc::malloc_trim(0);
