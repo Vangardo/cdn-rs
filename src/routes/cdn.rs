@@ -23,6 +23,7 @@ use tokio::{
     io::{AsyncWriteExt, BufWriter},
     sync::Mutex,
 };
+use uuid::Uuid;
 
 #[utoipa::path(
     post,
@@ -200,18 +201,17 @@ pub async fn get_resize_image_root(
     let w_cap = cap(w);
     let h_cap = cap(h);
 
-    if let Some(uuid) = util::parse_guid(&guid) {
-        let (disk_path, _) =
-            variant_disk_path(&settings, uuid, w_cap, h_cap, Some("JPEG"), Some("ffffff"));
-        if tokio_fs::try_exists(&disk_path).await.unwrap_or(false) {
-            let file = NamedFile::open_async(disk_path)
-                .await
-                .map_err(|e| ApiError::Io(e.to_string()))?;
-            return Ok(file.into_response(&req));
-        }
+    let uuid = util::parse_guid(&guid).unwrap_or(Uuid::nil());
+    let (disk_path, _) =
+        variant_disk_path(&settings, uuid, w_cap, h_cap, Some("JPEG"), Some("ffffff"));
+    if tokio_fs::try_exists(&disk_path).await.unwrap_or(false) {
+        let file = NamedFile::open_async(disk_path)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+        return Ok(file.into_response(&req));
     }
 
-    let (bytes, ct) = get_resize_image_bytes(
+    get_resize_image_bytes(
         &guid,
         w_cap,
         h_cap,
@@ -222,7 +222,10 @@ pub async fn get_resize_image_root(
         &client,
     )
     .await?;
-    Ok(HttpResponse::Ok().content_type(ct).body(bytes))
+    let file = NamedFile::open_async(disk_path)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+    Ok(file.into_response(&req))
 }
 
 #[utoipa::path(
@@ -260,6 +263,7 @@ pub struct FormatQuery {
  )]
 #[get("/{img_guid}.{format}")]
 pub async fn get_image_with_format(
+    req: HttpRequest,
     path: web::Path<(String, String)>,
     q: web::Query<FormatQuery>,
     db: web::Data<Db>,
@@ -271,7 +275,22 @@ pub async fn get_image_with_format(
     if !valid.iter().any(|v| v.eq_ignore_ascii_case(&format)) {
         format = "jpeg".into();
     }
-    let (bytes, ct) = get_resize_image_bytes(
+    let uuid = util::parse_guid(&guid).unwrap_or(Uuid::nil());
+    let (disk_path, _) = variant_disk_path(
+        &settings,
+        uuid,
+        q.odn_width,
+        q.odn_height,
+        Some(&format),
+        q.odn_bg.as_deref(),
+    );
+    if tokio_fs::try_exists(&disk_path).await.unwrap_or(false) {
+        let file = NamedFile::open_async(disk_path)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+        return Ok(file.into_response(&req));
+    }
+    get_resize_image_bytes(
         &guid,
         q.odn_width,
         q.odn_height,
@@ -282,7 +301,10 @@ pub async fn get_image_with_format(
         &client,
     )
     .await?;
-    Ok(HttpResponse::Ok().content_type(ct).body(bytes))
+    let file = NamedFile::open_async(disk_path)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+    Ok(file.into_response(&req))
 }
 
 #[utoipa::path(
@@ -293,6 +315,7 @@ pub async fn get_image_with_format(
  )]
 #[get("/images/{img_guid}/{parametr_images}")]
 pub async fn get_resize_image_prefixed(
+    req: HttpRequest,
     path: web::Path<(String, String)>,
     db: web::Data<Db>,
     settings: web::Data<Settings>,
@@ -303,11 +326,21 @@ pub async fn get_resize_image_prefixed(
     let h = parts.next().and_then(|s| s.parse::<u32>().ok());
     let w = parts.next().and_then(|s| s.parse::<u32>().ok());
     let cap = |v: Option<u32>| v.map(|x| x.min(settings.max_image_side));
-
-    let (bytes, ct) = get_resize_image_bytes(
+    let w_cap = cap(w);
+    let h_cap = cap(h);
+    let uuid = util::parse_guid(&guid).unwrap_or(Uuid::nil());
+    let (disk_path, _) =
+        variant_disk_path(&settings, uuid, w_cap, h_cap, Some("JPEG"), Some("ffffff"));
+    if tokio_fs::try_exists(&disk_path).await.unwrap_or(false) {
+        let file = NamedFile::open_async(disk_path)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+        return Ok(file.into_response(&req));
+    }
+    get_resize_image_bytes(
         &guid,
-        cap(w),
-        cap(h),
+        w_cap,
+        h_cap,
         Some("JPEG"),
         Some("ffffff"),
         &db,
@@ -315,7 +348,10 @@ pub async fn get_resize_image_prefixed(
         &client,
     )
     .await?;
-    Ok(HttpResponse::Ok().content_type(ct).body(bytes))
+    let file = NamedFile::open_async(disk_path)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+    Ok(file.into_response(&req))
 }
 
 #[utoipa::path(

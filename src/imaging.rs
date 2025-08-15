@@ -679,7 +679,7 @@ pub async fn get_resize_image_bytes(
     db: &Db,
     settings: &Settings,
     client: &Client,
-) -> Result<(Vec<u8>, String), ApiError> {
+) -> Result<(), ApiError> {
     let started = Instant::now();
 
     let guid = if util::is_guid(guid_or_slug) {
@@ -692,7 +692,7 @@ pub async fn get_resize_image_bytes(
     let bg_hex_owned = bg_hex.map(|s| s.to_string());
 
     // 1. СНАЧАЛА ПРОВЕРЯЕМ ДИСК - самый быстрый для CDN
-    let (disk_path, ct_guess) = variant_disk_path(
+    let (disk_path, _ct_guess) = variant_disk_path(
         settings,
         guid,
         width,
@@ -701,13 +701,13 @@ pub async fn get_resize_image_bytes(
         bg_hex_owned.as_deref(),
     );
 
-    if let Ok(bytes) = tokio_fs::read(&disk_path).await {
-        return Ok((bytes, ct_guess));
+    if tokio_fs::try_exists(&disk_path).await.unwrap_or(false) {
+        return Ok(());
     }
 
-    let result = with_variant_lock(&disk_path, async {
-        if let Ok(bytes) = tokio_fs::read(&disk_path).await {
-            return Ok((bytes, ct_guess.clone()));
+    with_variant_lock(&disk_path, async {
+        if tokio_fs::try_exists(&disk_path).await.unwrap_or(false) {
+            return Ok(());
         }
 
         let input_path = if guid.is_nil() {
@@ -751,7 +751,11 @@ pub async fn get_resize_image_bytes(
             atomic_write(&disk_path, &buf)
                 .await
                 .map_err(|e| ApiError::Io(e.to_string()))?;
-            return Ok((buf, ct_guess.clone()));
+            let mut buf = buf;
+            buf.clear();
+            buf.shrink_to_fit();
+            release_memory();
+            return Ok(());
         }
 
         // Увеличиваем счетчик активных задач
@@ -764,7 +768,8 @@ pub async fn get_resize_image_bytes(
         let permit = BLOCKING_SEM.clone().acquire_owned().await.unwrap();
         let input_path_clone = input_path.clone();
         let no_image_path_clone = no_image_path.clone();
-        let (buf, ct) = task::spawn_blocking(move || -> Result<(Vec<u8>, String), ApiError> {
+        let disk_path_clone = disk_path.clone();
+        task::spawn_blocking(move || -> Result<(), ApiError> {
             let _permit = permit; // permit автоматически освободится при drop
 
             // Проверяем размер данных перед обработкой
@@ -833,8 +838,28 @@ pub async fn get_resize_image_bytes(
                         .map(|s| s.eq_ignore_ascii_case("ffffff"))
                         .unwrap_or(true)
                 {
-                    // Если ресайз не нужен, возвращаем оригинал
-                    return Ok((data, "image/jpeg".to_string()));
+                    // Если ресайз не нужен, сохраняем оригинал на диск
+                    use std::io::Write;
+                    if let Some(parent) = std::path::Path::new(&disk_path_clone).parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| ApiError::Io(e.to_string()))?;
+                    }
+                    let tmp = format!("{disk_path_clone}.part");
+                    let mut f =
+                        std::fs::File::create(&tmp).map_err(|e| ApiError::Io(e.to_string()))?;
+                    f.write_all(&data)
+                        .map_err(|e| ApiError::Io(e.to_string()))?;
+                    f.sync_all().map_err(|e| ApiError::Io(e.to_string()))?;
+                    std::fs::rename(&tmp, &disk_path_clone)
+                        .map_err(|e| ApiError::Io(e.to_string()))?;
+
+                    let mut d = data;
+                    d.clear();
+                    d.shrink_to_fit();
+                    #[cfg(target_os = "linux")]
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                    return Ok(());
                 }
 
                 // Оригинальные данные больше не нужны
@@ -920,33 +945,37 @@ pub async fn get_resize_image_bytes(
                 }
             }
 
-            let ct = match fmt {
-                ImageFormat::Png => "image/png",
-                ImageFormat::Gif => "image/gif",
-                ImageFormat::Tiff => "image/tiff",
-                ImageFormat::WebP => "image/webp",
-                _ => "image/jpeg",
-            }
-            .to_string();
-
-            // Финальная проверка - буфер не должен быть пустым
             if buf.is_empty() {
                 return Err(ApiError::Img("generated image buffer is empty".into()));
             }
 
-            Ok((buf, ct))
+            // Write directly to disk
+            use std::io::Write;
+            if let Some(parent) = std::path::Path::new(&disk_path_clone).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| ApiError::Io(e.to_string()))?;
+            }
+            let tmp = format!("{disk_path_clone}.part");
+            let mut f = std::fs::File::create(&tmp).map_err(|e| ApiError::Io(e.to_string()))?;
+            f.write_all(&buf).map_err(|e| ApiError::Io(e.to_string()))?;
+            f.sync_all().map_err(|e| ApiError::Io(e.to_string()))?;
+            std::fs::rename(&tmp, &disk_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
+
+            let mut b = buf;
+            b.clear();
+            b.shrink_to_fit();
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::malloc_trim(0);
+            }
+
+            Ok(())
         })
         .await
         .map_err(|_| ApiError::Internal)??;
 
-        atomic_write(&disk_path, &buf)
-            .await
-            .map_err(|e| ApiError::Io(e.to_string()))?;
-        let mut buf = buf;
-        buf.shrink_to_fit();
         // Try to release the memory held by intermediate buffers
         release_memory();
-        Ok((buf, ct))
+        Ok(())
     })
     .await?;
 
@@ -963,5 +992,5 @@ pub async fn get_resize_image_bytes(
             started.elapsed().as_millis()
         );
     }
-    Ok(result)
+    Ok(())
 }
