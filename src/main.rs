@@ -1,4 +1,3 @@
-mod cache;
 mod config;
 mod db;
 mod errors;
@@ -10,7 +9,6 @@ mod routes;
 mod util;
 
 use actix_web::{middleware::Logger, web, App, HttpServer};
-use cache::Cache;
 use config::Settings;
 use db::Db;
 use reqwest::Client;
@@ -40,15 +38,6 @@ async fn main() -> std::io::Result<()> {
     }
     let client = client_builder.build().expect("reqwest client build failed");
 
-    let redis_url = settings.redis_url();
-    let cache = Cache::new(if settings.use_cache {
-        Some(&redis_url)
-    } else {
-        None
-    })
-    .await
-    .expect("redis connect failed");
-
     // OpenAPI
     let mut openapi = openapi::ApiDoc::openapi();
     openapi.info.title = settings.swagger_title.clone();
@@ -71,7 +60,6 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(settings.clone()))
             .app_data(web::Data::new(db.clone()))
             .app_data(web::Data::new(client.clone()))
-            .app_data(web::Data::new(cache.clone()))
             .wrap(Logger::new("%r %s %Dms"))
             // порядок важен, чтобы /images/... не перехватывался общим мэчером
             .service(routes::cdn::push_image)

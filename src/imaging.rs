@@ -1,4 +1,4 @@
-use crate::{cache::Cache, config::Settings, db::Db, errors::ApiError, util};
+use crate::{config::Settings, db::Db, errors::ApiError, util};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use dashmap::DashMap;
@@ -353,7 +353,6 @@ pub async fn get_resize_image_bytes(
     db: &Db,
     settings: &Settings,
     client: &Client,
-    _cache: &Cache, // Оставляем для совместимости, но не используем
 ) -> Result<(Vec<u8>, String), ApiError> {
     let started = Instant::now();
 
