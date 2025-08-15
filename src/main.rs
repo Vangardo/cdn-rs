@@ -11,10 +11,14 @@ mod util;
 use actix_web::{middleware::Logger, web, App, HttpServer};
 use config::Settings;
 use db::Db;
+use mimalloc::MiMalloc;
 use reqwest::Client;
+use std::time::Duration;
 use tracing_subscriber::{fmt, EnvFilter};
 use utoipa::OpenApi;
-use std::time::Duration;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -53,12 +57,14 @@ async fn main() -> std::io::Result<()> {
             let mut interval = tokio::time::interval(Duration::from_secs(30)); // Увеличиваем частоту мониторинга
             loop {
                 interval.tick().await;
-                
+
                 // Получаем информацию о памяти (только для Linux/Unix)
                 #[cfg(target_os = "linux")]
                 {
                     if let Ok(contents) = std::fs::read_to_string("/proc/self/status") {
-                        if let Some(mem_line) = contents.lines().find(|line| line.starts_with("VmRSS:")) {
+                        if let Some(mem_line) =
+                            contents.lines().find(|line| line.starts_with("VmRSS:"))
+                        {
                             if let Some(kb_str) = mem_line.split_whitespace().nth(1) {
                                 if let Ok(kb) = kb_str.parse::<u64>() {
                                     let mb = kb / 1024;
@@ -68,20 +74,22 @@ async fn main() -> std::io::Result<()> {
                         }
                     }
                 }
-                
+
                 // Для Windows используем другой подход
                 #[cfg(target_os = "windows")]
                 {
-                    // Windows не предоставляет простой способ получить RSS, 
+                    // Windows не предоставляет простой способ получить RSS,
                     // но можно использовать системные API если нужно
                     tracing::debug!("Memory monitoring on Windows (not implemented)");
                 }
-                
+
                 // Если память превышает 500MB, логируем предупреждение
                 #[cfg(target_os = "linux")]
                 {
                     if let Ok(contents) = std::fs::read_to_string("/proc/self/status") {
-                        if let Some(mem_line) = contents.lines().find(|line| line.starts_with("VmRSS:")) {
+                        if let Some(mem_line) =
+                            contents.lines().find(|line| line.starts_with("VmRSS:"))
+                        {
                             if let Some(kb_str) = mem_line.split_whitespace().nth(1) {
                                 if let Ok(kb) = kb_str.parse::<u64>() {
                                     let mb = kb / 1024;
