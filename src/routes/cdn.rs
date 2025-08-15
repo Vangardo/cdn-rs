@@ -18,7 +18,11 @@ use bytes::Bytes;
 use reqwest::Client;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::{fs as tokio_fs, io::AsyncWriteExt, sync::Mutex};
+use tokio::{
+    fs as tokio_fs,
+    io::{AsyncWriteExt, BufWriter},
+    sync::Mutex,
+};
 
 #[utoipa::path(
     post,
@@ -69,9 +73,9 @@ async fn stream_original(
             return Ok(file.into_response(&req));
         }
     };
-    let path = format!("{}{}.jpg", settings.media_base_dir, uuid);
-    if tokio_fs::try_exists(&path).await.unwrap_or(false) {
-        let file = NamedFile::open_async(path)
+    let final_path = format!("{}{}.jpg", settings.media_base_dir, uuid);
+    if tokio_fs::try_exists(&final_path).await.unwrap_or(false) {
+        let file = NamedFile::open_async(final_path)
             .await
             .map_err(|e| ApiError::Io(e.to_string()))?;
         return Ok(file.into_response(&req));
@@ -95,7 +99,7 @@ async fn stream_original(
             return Ok(file.into_response(&req));
         }
     };
-    if let Some(parent) = Path::new(&path).parent() {
+    if let Some(parent) = Path::new(&final_path).parent() {
         tokio_fs::create_dir_all(parent)
             .await
             .map_err(|e| ApiError::Io(e.to_string()))?;
@@ -106,11 +110,15 @@ async fn stream_original(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("image/jpeg")
         .to_string();
+    let tmp_path = format!("{}.part", final_path);
     let state = Arc::new(Mutex::new((
-        tokio_fs::File::create(path)
-            .await
-            .map_err(|e| ApiError::Io(e.to_string()))?,
+        BufWriter::new(
+            tokio_fs::File::create(&tmp_path)
+                .await
+                .map_err(|e| ApiError::Io(e.to_string()))?,
+        ),
         0usize,
+        false,
     )));
     const MAX_STREAM_SIZE: usize = 100 * 1024 * 1024; // 100MB limit для stream
     let stream_state = state.clone();
@@ -120,17 +128,27 @@ async fn stream_original(
             match item {
                 Ok(chunk) => {
                     let mut guard = state.lock().await;
+                    if guard.2 {
+                        return Err(actix_web::error::ErrorInternalServerError("writer failed"));
+                    }
                     guard.1 += chunk.len();
                     if guard.1 > MAX_STREAM_SIZE {
-                        tracing::warn!("Stream exceeded size limit: {} bytes", guard.1);
+                        tracing::warn!("Stream exceeded size limit: {}", guard.1);
+                        guard.2 = true;
                         return Err(actix_web::error::ErrorPayloadTooLarge("stream too big"));
                     }
                     if let Err(e) = guard.0.write_all(&chunk).await {
-                        tracing::error!("Failed to write chunk to file: {e}");
+                        tracing::error!("Failed to write chunk: {e}");
+                        guard.2 = true;
+                        return Err(actix_web::error::ErrorInternalServerError(e));
                     }
                     Ok::<Bytes, actix_web::Error>(chunk)
                 }
-                Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
+                Err(e) => {
+                    let mut guard = state.lock().await;
+                    guard.2 = true;
+                    Err(actix_web::error::ErrorInternalServerError(e))
+                }
             }
         }
     });
@@ -140,11 +158,18 @@ async fn stream_original(
         loop {
             if Arc::strong_count(&finalize_state) == 1 {
                 let mut guard = finalize_state.lock().await;
+                let was_error = guard.2;
                 let _ = guard.0.flush().await;
-                let _ = guard.0.sync_all().await;
+                let _ = guard.0.get_ref().sync_all().await;
+                drop(guard);
+                if was_error {
+                    let _ = tokio_fs::remove_file(&tmp_path).await;
+                } else {
+                    let _ = tokio_fs::rename(&tmp_path, &final_path).await;
+                }
                 break;
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_millis(200)).await;
         }
     });
     Ok(HttpResponse::Ok().content_type(ct).streaming(stream))
