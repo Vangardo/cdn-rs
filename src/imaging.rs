@@ -12,7 +12,6 @@ use reqwest::Client;
 use std::{
     collections::HashMap,
     fs,
-    io::Cursor,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -44,7 +43,7 @@ pub fn get_active_tasks_count() -> usize {
 
 const JPEG_Q: f32 = 85.0;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn release_memory() {
     // SAFETY: libc::malloc_trim is unsafe as it interacts with the global allocator
     // directly. We call it without any arguments to release free memory back to the OS.
@@ -53,53 +52,13 @@ fn release_memory() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), target_env = "musl"))]
 fn release_memory() {}
 
 async fn ensure_dir_async(path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         tokio_fs::create_dir_all(parent).await?;
     }
-    Ok(())
-}
-
-async fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = Path::new(path).parent() {
-        tokio_fs::create_dir_all(parent).await?;
-    }
-    let tmp = format!("{}.part", path);
-    let mut f = tokio_fs::File::create(&tmp).await?;
-    f.write_all(bytes).await?;
-    f.flush().await?;
-    f.sync_all().await?;
-    drop(f);
-
-    // Принудительно освобождаем файловые буферы
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(_) = std::process::Command::new("sync")
-            .arg("-f")
-            .arg(&tmp)
-            .status()
-        {
-            // Синхронизируем конкретный файл
-        }
-    }
-
-    tokio_fs::rename(&tmp, path).await?;
-
-    // Финальная синхронизация
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(_) = std::process::Command::new("sync")
-            .arg("-f")
-            .arg(path)
-            .status()
-        {
-            // Синхронизируем финальный файл
-        }
-    }
-
     Ok(())
 }
 
@@ -423,7 +382,7 @@ pub async fn save_img_from_url(
     client: &Client,
     url: &str,
     output_path: &str,
-) -> Result<Vec<u8>, ApiError> {
+) -> Result<(), ApiError> {
     if url.is_empty() {
         return Err(ApiError::BadRequest("empty url".into()));
     }
@@ -465,11 +424,6 @@ pub async fn save_img_from_url(
     }
 
     let mut stream = resp.bytes_stream();
-    let cap = content_length
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(0)
-        .min(MAX_IMAGE_SIZE);
-    let mut buf = Vec::with_capacity(cap);
     if let Some(parent) = Path::new(output_path).parent() {
         tokio_fs::create_dir_all(parent)
             .await
@@ -492,7 +446,6 @@ pub async fn save_img_from_url(
         file.write_all(&chunk)
             .await
             .map_err(|e| ApiError::Io(e.to_string()))?;
-        buf.extend_from_slice(&chunk);
     }
     if let Some(cl) = content_length {
         if downloaded as u64 != cl {
@@ -511,7 +464,7 @@ pub async fn save_img_from_url(
         .map_err(|e| ApiError::Io(e.to_string()))?;
 
     // Проверяем, что это валидное изображение и получаем его размеры
-    let img = image::load_from_memory(&buf)
+    let img = image::open(output_path)
         .map_err(|e| ApiError::Img(format!("invalid image data: {}", e)))?;
 
     let (img_w, img_h) = (img.width(), img.height());
@@ -528,7 +481,7 @@ pub async fn save_img_from_url(
     drop(img);
     release_memory();
 
-    Ok(buf)
+    Ok(())
 }
 
 pub async fn convert_and_save_jpg(
@@ -733,11 +686,11 @@ pub async fn get_resize_image_bytes(
             format!("{}{}.jpg", settings.media_base_dir, guid)
         };
 
-        let file_exists = tokio_fs::try_exists(&input_path).await.unwrap_or(false);
-        let mut downloaded: Option<Vec<u8>> = None;
+        let mut file_exists = tokio_fs::try_exists(&input_path).await.unwrap_or(false);
         if !file_exists && !guid.is_nil() {
             if let Some(link) = db.get_original_link_by_guid(guid).await? {
-                downloaded = save_img_from_url(client, &link, &input_path).await.ok();
+                let _ = save_img_from_url(client, &link, &input_path).await;
+                file_exists = tokio_fs::try_exists(&input_path).await.unwrap_or(false);
             }
         }
 
@@ -754,23 +707,29 @@ pub async fn get_resize_image_bytes(
                 .map(|s| s.eq_ignore_ascii_case("ffffff"))
                 .unwrap_or(true)
         {
-            let buf = if let Some(buf) = downloaded {
-                buf
-            } else if file_exists {
-                tokio_fs::read(&input_path)
-                    .await
-                    .map_err(|e| ApiError::Io(e.to_string()))?
+            let src = if file_exists {
+                &input_path
             } else {
-                tokio_fs::read(&no_image_path)
-                    .await
-                    .map_err(|e| ApiError::Io(e.to_string()))?
+                &no_image_path
             };
-            atomic_write(&disk_path, &buf)
+            if let Some(parent) = Path::new(&disk_path).parent() {
+                tokio_fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| ApiError::Io(e.to_string()))?;
+            }
+            if tokio_fs::hard_link(src, &disk_path)
                 .await
-                .map_err(|e| ApiError::Io(e.to_string()))?;
-            let mut buf = buf;
-            buf.clear();
-            buf.shrink_to_fit();
+                .map_err(|e| ApiError::Io(e.to_string()))
+                .is_err()
+            {
+                let tmp = format!("{}.part", &disk_path);
+                tokio_fs::copy(src, &tmp)
+                    .await
+                    .map_err(|e| ApiError::Io(e.to_string()))?;
+                tokio_fs::rename(&tmp, &disk_path)
+                    .await
+                    .map_err(|e| ApiError::Io(e.to_string()))?;
+            }
             release_memory();
             return Ok(());
         }
@@ -790,16 +749,7 @@ pub async fn get_resize_image_bytes(
             let _permit = permit; // permit автоматически освободится при drop
 
             // Проверяем размер данных перед обработкой
-            let data = if let Some(b) = downloaded {
-                if b.len() > MAX_IMAGE_SIZE {
-                    return Err(ApiError::BadRequest(format!(
-                        "downloaded image too large: {} bytes (max: {} bytes)",
-                        b.len(),
-                        MAX_IMAGE_SIZE
-                    )));
-                }
-                b
-            } else if Path::new(&input_path_clone).exists() {
+            let data = if Path::new(&input_path_clone).exists() {
                 let file_data =
                     fs::read(&input_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
                 if file_data.len() > MAX_IMAGE_SIZE {
@@ -927,56 +877,44 @@ pub async fn get_resize_image_bytes(
                     _ => ImageFormat::Jpeg,
                 };
 
-                let mut buf = Vec::new();
-                {
-                    let rgb_local = rgb;
-                    match fmt {
-                        ImageFormat::Jpeg => {
-                            let mut cur = Cursor::new(&mut buf);
-                            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                                &mut cur,
-                                JPEG_Q as u8,
-                            );
-                            encoder
-                                .encode(
-                                    &rgb_local,
-                                    rgb_local.width(),
-                                    rgb_local.height(),
-                                    image::ColorType::Rgb8.into(),
-                                )
-                                .map_err(|e| {
-                                    ApiError::Img(format!("JPEG encoding failed: {}", e))
-                                })?;
-                        }
-                        other => {
-                            let mut cur = Cursor::new(&mut buf);
-                            DynamicImage::ImageRgb8(rgb_local)
-                                .write_to(&mut cur, other)
-                                .map_err(|e| ApiError::Img(e.to_string()))?;
-                        }
-                    }
-                }
-
-                if buf.is_empty() {
-                    return Err(ApiError::Img("generated image buffer is empty".into()));
-                }
-
-                use std::io::Write;
+                use std::io::{BufWriter, Write};
                 if let Some(parent) = std::path::Path::new(&disk_path_clone).parent() {
                     std::fs::create_dir_all(parent).map_err(|e| ApiError::Io(e.to_string()))?;
                 }
                 let tmp = format!("{disk_path_clone}.part");
-                let mut f = std::fs::File::create(&tmp).map_err(|e| ApiError::Io(e.to_string()))?;
-                f.write_all(&buf).map_err(|e| ApiError::Io(e.to_string()))?;
-                f.sync_all().map_err(|e| ApiError::Io(e.to_string()))?;
+                let file = std::fs::File::create(&tmp).map_err(|e| ApiError::Io(e.to_string()))?;
+                let mut writer = BufWriter::new(file);
+                match fmt {
+                    ImageFormat::Jpeg => {
+                        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                            &mut writer,
+                            JPEG_Q as u8,
+                        );
+                        encoder
+                            .encode(
+                                &rgb,
+                                rgb.width(),
+                                rgb.height(),
+                                image::ColorType::Rgb8.into(),
+                            )
+                            .map_err(|e| ApiError::Img(format!("JPEG encoding failed: {}", e)))?;
+                    }
+                    other => {
+                        DynamicImage::ImageRgb8(rgb)
+                            .write_to(&mut writer, other)
+                            .map_err(|e| ApiError::Img(e.to_string()))?;
+                    }
+                }
+                writer.flush().map_err(|e| ApiError::Io(e.to_string()))?;
+                let file = writer
+                    .into_inner()
+                    .map_err(|e| ApiError::Io(e.to_string()))?;
+                file.sync_all().map_err(|e| ApiError::Io(e.to_string()))?;
+                drop(file);
                 std::fs::rename(&tmp, &disk_path_clone).map_err(|e| ApiError::Io(e.to_string()))?;
-
-                buf.clear();
-                buf.shrink_to_fit();
-                drop(buf);
             }
 
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
             unsafe {
                 libc::malloc_trim(0);
             }
