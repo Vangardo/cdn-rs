@@ -2,6 +2,7 @@ use crate::{config::Settings, db::Db, errors::ApiError, util};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use fast_image_resize::{self as fir, images::Image as FirImage};
+use futures_util::StreamExt;
 use image::imageops;
 use image::{self, DynamicImage, ImageFormat, RgbImage};
 #[cfg(target_os = "linux")]
@@ -457,27 +458,47 @@ pub async fn save_img_from_url(
         }
     }
 
-    let bytes = resp
-        .bytes()
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::with_capacity(content_length.unwrap_or(0) as usize);
+    if let Some(parent) = Path::new(output_path).parent() {
+        tokio_fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+    }
+    let tmp = format!("{}.part", output_path);
+    let mut file = tokio_fs::File::create(&tmp)
         .await
         .map_err(|e| ApiError::Io(e.to_string()))?;
-
-    // Проверяем размер после загрузки
-    if bytes.len() > MAX_IMAGE_SIZE {
-        return Err(ApiError::BadRequest(format!(
-            "image too large: {} bytes (max: {} bytes)",
-            bytes.len(),
-            MAX_IMAGE_SIZE
-        )));
+    let mut downloaded = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ApiError::Io(e.to_string()))?;
+        downloaded += chunk.len();
+        if downloaded > MAX_IMAGE_SIZE {
+            return Err(ApiError::BadRequest(format!(
+                "image too large: {} bytes (max: {} bytes)",
+                downloaded, MAX_IMAGE_SIZE
+            )));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| ApiError::Io(e.to_string()))?;
+        buf.extend_from_slice(&chunk);
     }
-
     if let Some(cl) = content_length {
-        if bytes.len() as u64 != cl {
+        if downloaded as u64 != cl {
             return Err(ApiError::Img("truncated download".into()));
         }
     }
-
-    let buf = bytes.to_vec();
+    file.flush()
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+    file.sync_all()
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
+    drop(file);
+    tokio_fs::rename(&tmp, output_path)
+        .await
+        .map_err(|e| ApiError::Io(e.to_string()))?;
 
     // Проверяем, что это валидное изображение и получаем его размеры
     let img = image::load_from_memory(&buf)
@@ -494,9 +515,6 @@ pub async fn save_img_from_url(
         )));
     }
 
-    atomic_write(output_path, &buf)
-        .await
-        .map_err(|e| ApiError::Io(e.to_string()))?;
     Ok(buf)
 }
 
